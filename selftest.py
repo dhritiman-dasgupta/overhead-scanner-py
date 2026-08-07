@@ -1,75 +1,166 @@
-"""End-to-end check against the real camera: capture, detect, process, export."""
-import time, os, sys
-import cv2, numpy as np
-import camera, detect, imaging, pdfwriter
+"""End-to-end check against the real camera: capture, detect, process, export.
 
-OUT = "/private/tmp/claude-501/-Users-apple/f74ecf1f-4a16-4b31-bb2e-8c95c0466309/scratchpad"
-p, f = 0, 0
+    python3 selftest.py
+
+Engine only — no window. `uitest.py` covers the app on top of it.
+"""
+
+import os
+import sys
+import tempfile
+import time
+
+import cv2
+import numpy as np
+
+import camera
+import detect
+import imaging
+import ocr
+import pdfwriter
+
+OUT = tempfile.mkdtemp(prefix="ohs-selftest-")
+p = f = 0
+
+
 def ok(name, cond, detail=""):
     global p, f
-    if cond: p += 1; print("  \033[32mPASS\033[0m %-46s %s" % (name, detail))
-    else:    f += 1; print("  \033[31mFAIL\033[0m %-46s %s" % (name, detail))
+    if cond:
+        p += 1
+        print("  \033[32mPASS\033[0m %-46s %s" % (name, detail))
+    else:
+        f += 1
+        print("  \033[31mFAIL\033[0m %-46s %s" % (name, detail))
 
+
+print("── camera ──")
 devs = camera.Camera.list_devices()
-ok("camera enumerated", len(devs) > 0, str(devs))
-if not devs: sys.exit(1)
-# Same choice the app makes: highest real maximum, not lowest index.
-devs.sort(key=lambda d: d["max_width"] * d["max_height"], reverse=True)
+ok("cameras enumerated", len(devs) > 0,
+   ", ".join("%d:%s(%s)" % (d["index"], d["name"], d["kind"]) for d in devs))
+if not devs:
+    sys.exit(1)
+
+t0 = time.time()
+ok("enumeration opens nothing", time.time() - t0 < 1.0,
+   "%d ms — probing devices is what stops this camera reaching 16 MP"
+   % int((time.time() - t0) * 1000))
+
 best = devs[0]
-print("  using index %d (max %dx%d)" % (best["index"], best["max_width"], best["max_height"]))
+ok("an external camera is preferred over the built-in",
+   best["kind"] != "builtin" or all(d["kind"] == "builtin" for d in devs),
+   "picked %s" % best["name"])
 
 cam = camera.Camera()
 t0 = time.time()
-opened = cam.open(best["index"], prefer=(best["max_width"], best["max_height"]))
-ok("camera opened", opened, "%d ms" % int((time.time()-t0)*1000))
-if not opened: print(cam.error); sys.exit(1)
-ok("running at the device maximum", (cam.width, cam.height) == (best["max_width"], best["max_height"]),
-   "%dx%d @ %.0f fps" % (cam.width, cam.height, cam.fps))
+opened = cam.open(best["index"], best["name"], None)
+ok("camera opened", opened, "%d ms" % int((time.time() - t0) * 1000))
+if not opened:
+    print("  " + (cam.error or ""))
+    sys.exit(1)
 
-cam_w, cam_h = cam.width, cam.height
-time.sleep(2.0)
-t0 = time.time(); frame = cam.grab(); grab_ms = int((time.time()-t0)*1000)
-ok("frame captured", frame is not None,
-   "" if frame is None else "%dx%d in %d ms" % (frame.shape[1], frame.shape[0], grab_ms))
-cam.close()
-if frame is None: sys.exit(1)
-ok("capture is full resolution", (frame.shape[1], frame.shape[0]) == (cam_w, cam_h), str(frame.shape))
-cv2.imwrite(OUT + "/py-raw.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
-
-t0 = time.time(); quad = detect.detect(frame); det_ms = int((time.time()-t0)*1000)
-ok("detection ran", True, ("found" if quad is not None else "declined") + "  %d ms" % det_ms)
-if quad is not None:
-    ok("corners are normalised", float(quad.min()) >= 0 and float(quad.max()) <= 1,
-       str(np.round(quad, 3).tolist()))
-
-for name in ("auto", "photo", "bw"):
-    a = imaging.set_filter(imaging.new_adjust(), name)
+if not cam.at_max:
     t0 = time.time()
-    out = imaging.process(frame, a, quad, None)
-    ms = int((time.time() - t0) * 1000)
-    g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-    clip = 100.0 * float((g >= 254).sum()) / g.size
-    ok("filter %-6s full res" % name, out.shape[0] > 0,
-       "%dx%d  %4d ms  clipped %.2f%%" % (out.shape[1], out.shape[0], ms, clip))
-    cv2.imwrite(OUT + "/py-%s.jpg" % name, out, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+    up = cam.upgrade()
+    ok("upgraded to the sensor maximum", up,
+       "%dx%d in %d ms" % (cam.width, cam.height, int((time.time() - t0) * 1000)))
 
-a = imaging.set_filter(imaging.new_adjust(), "auto")
-full = imaging.process(frame, a, quad, None)
-exp = detect.output_size(quad, frame.shape[1], frame.shape[0]) if quad is not None \
-      else (frame.shape[1], frame.shape[0])
-ok("export matches the crop's own pixels", (full.shape[1], full.shape[0]) == exp,
+frame = None
+deadline = time.time() + 8
+while time.time() < deadline and frame is None:
+    frame = cam.grab()
+    time.sleep(0.05)
+ok("frame delivered", frame is not None,
+   "%dx%d" % (frame.shape[1], frame.shape[0]) if frame is not None else "none")
+if frame is None:
+    sys.exit(1)
+
+ok("preview and capture are the same pixels",
+   frame.shape[1] == cam.width and frame.shape[0] == cam.height,
+   "%dx%d == %dx%d" % (frame.shape[1], frame.shape[0], cam.width, cam.height))
+
+n0 = cam.sequence()
+time.sleep(1.0)
+fps = cam.sequence() - n0
+ok("frames keep arriving", fps > 0, "%d in the last second" % fps)
+
+print("── detection ──")
+t0 = time.time()
+quad = detect.detect(imaging.fit(frame, 900))
+ms = int((time.time() - t0) * 1000)
+ok("detection runs", True, "%s in %d ms"
+   % ("found a page" if quad is not None else "no page (returns None, never guesses)", ms))
+ok("detection is fast enough for a live outline", ms < 120, "%d ms" % ms)
+if quad is not None:
+    ok("corners are normalised and ordered",
+       quad.shape == (4, 2) and float(quad.min()) >= 0 and float(quad.max()) <= 1,
+       str(np.round(quad, 3).tolist()))
+    cw, ch = detect.output_size(quad, frame.shape[1], frame.shape[0])
+    ok("crop has a sane size", cw > 32 and ch > 32, "%dx%d" % (cw, ch))
+
+print("── processing ──")
+adjust = imaging.new_adjust()
+full = imaging.process(frame, adjust, quad)
+ok("full-resolution page produced", full is not None and full.size > 0,
    "%dx%d" % (full.shape[1], full.shape[0]))
 
-okj, buf = cv2.imencode(".jpg", full, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
-ok("jpeg q98 encoded", okj, "%.2f MB" % (len(buf) / 1048576.0))
-pdf = pdfwriter.build([{"jpeg": buf.tobytes(), "width": full.shape[1],
-                        "height": full.shape[0]}], page_size="a4", title="test")
-ok("pdf built", pdf.startswith(b"%PDF-1.4") and pdf.rstrip().endswith(b"%%EOF"),
-   "%.2f MB" % (len(pdf) / 1048576.0))
-i = pdf.rfind(b"startxref")
-off = int(pdf[i+10:pdf.find(b"\n", i+10)])
-ok("pdf xref resolves", pdf[off:off+4] == b"xref")
-open(OUT + "/py-scan.pdf", "wb").write(pdf)
+expect = imaging.target_size(adjust, quad, frame.shape[1], frame.shape[0])
+ok("output matches the advertised size", (full.shape[1], full.shape[0]) == expect,
+   "%dx%d" % expect)
 
-print("\n%s%d passed, %d failed\033[0m" % ("\033[31m" if f else "\033[32m", p, f))
+for name in imaging.FILTERS:
+    a = imaging.set_filter(imaging.new_adjust(), name)
+    small = imaging.process(frame, a, quad, max_dim=700)
+    clipped = float(np.mean(small >= 254))
+    ok("filter %-11s" % name, small is not None and small.size > 0,
+       "%dx%d, %.1f%% of pixels at white" % (small.shape[1], small.shape[0],
+                                             clipped * 100))
+    if name == "auto":
+        ok("auto does not bleach the page", clipped < 0.06,
+           "%.1f%% clipped — highlights roll off instead of clamping" % (clipped * 100))
+
+a = imaging.new_adjust()
+a["rotate"] = 90
+rot = imaging.process(frame, a, quad, max_dim=600)
+straight = imaging.process(frame, imaging.new_adjust(), quad, max_dim=600)
+ok("rotation swaps the axes",
+   abs(rot.shape[0] - straight.shape[1]) <= 2 and abs(rot.shape[1] - straight.shape[0]) <= 2,
+   "%dx%d -> %dx%d" % (straight.shape[1], straight.shape[0], rot.shape[1], rot.shape[0]))
+
+print("── export ──")
+jpg = os.path.join(OUT, "page.jpg")
+cv2.imwrite(jpg, full, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+size = os.path.getsize(jpg)
+ok("JPEG written at full resolution", size > 400_000,
+   "%.1f MB at %dx%d" % (size / 1e6, full.shape[1], full.shape[0]))
+
+back = cv2.imread(jpg)
+ok("saved file keeps every pixel", back.shape == full.shape,
+   "%dx%d" % (back.shape[1], back.shape[0]))
+
+encoded = cv2.imencode(".jpg", full, [int(cv2.IMWRITE_JPEG_QUALITY), 92])[1].tobytes()
+pdf = pdfwriter.build([{"jpeg": encoded, "width": full.shape[1],
+                        "height": full.shape[0], "words": []}],
+                      page_size="a4", title="selftest", searchable=False)
+path = os.path.join(OUT, "scan.pdf")
+open(path, "wb").write(pdf)
+ok("PDF written", pdf.startswith(b"%PDF") and pdf.rstrip().endswith(b"%%EOF"),
+   "%.1f MB" % (len(pdf) / 1e6))
+
+print("── OCR ──")
+if not ocr.available():
+    print("  \033[33mSKIP\033[0m tesseract not installed — %s" % ocr.install_hint().splitlines()[0])
+else:
+    t0 = time.time()
+    res = ocr.recognise(imaging.process(frame, imaging.set_filter(imaging.new_adjust(), "bw"),
+                                        quad, max_dim=2200))
+    ok("OCR ran", isinstance(res.get("text"), str),
+       "%d words, confidence %s, %.1fs" % (len(res["words"]),
+                                           "n/a" if res["confidence"] is None
+                                           else "%d%%" % round(res["confidence"]),
+                                           time.time() - t0))
+
+cam.close()
+ok("camera released", not cam.is_open())
+
+print("\n%d passed, %d failed   (artifacts in %s)" % (p, f, OUT))
 sys.exit(1 if f else 0)

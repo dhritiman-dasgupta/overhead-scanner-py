@@ -5,11 +5,11 @@ resolution, deskew, clean up, OCR, and export to image or searchable PDF.
 Everything runs locally.
 
 ```bash
+pip3 install --user PySide6            # once
 python3 scanner.py
 ```
 
-Needs `opencv-python`, `numpy` and `pillow` — all already present on this
-machine. Tkinter ships with Python.
+Also needs `opencv-python`, `numpy` and `pillow`.
 
 ---
 
@@ -24,7 +24,7 @@ past, and this is the measured record of it on the camera it was built for
 | Chrome video stream | 1598×1200 | the 4656×3496 mode takes **66 s** to a first frame — unusable as a preview |
 | Chrome `takePhoto()` | 4656×3496 | works, but ~3.3 s per shot, and its field of view differs from the preview |
 | macOS AVFoundation video | 1920×1080 | capped by the session preset whatever `activeFormat` says; `inputPriority` is unavailable on macOS |
-| **OpenCV (this app)** | **4656×3496** | direct, ~5–10 fps, and it *is* the preview |
+| **OpenCV (this app)** | **4656×3496** | direct, ~8–10 fps, and it *is* the preview |
 
 So there is no preview mode and no capture mode here. The camera runs at full
 resolution the whole time and a capture is the frame you were already looking
@@ -32,22 +32,40 @@ at. Preview and capture cannot disagree about resolution, field of view or what
 the page looked like, because they are the same pixels — which removes an
 entire class of bug the browser version kept running into.
 
+### And why Qt rather than Tkinter
+
+The only Python on this machine is Apple's, which ships **Tk 8.5.9**. On macOS
+26 that Tk does not repaint: the window comes up white, `tk.Button` ignores
+every colour it is given, and the camera preview never appears. This is a
+platform fault with no application-level fix, so the UI is PySide6, which draws
+everything itself and looks the same on macOS, Windows and Linux.
+
 ---
 
 ## Using it
 
-1. Pick the camera. The list shows each device's **real maximum**, probed by
-   asking for it, and the highest-resolution one is selected first. On a laptop
-   the document camera is rarely index 0, and choosing by index quietly hands
-   you 1080p from the built-in webcam.
-2. **Start camera**, put a page down. A green outline shows the page it found.
-3. **Capture**, or tick **Auto** to shoot whenever the scene goes still — the
-   page-turn workflow.
-4. Pick a filter, adjust if needed, then **Save image** or **Save PDF**.
+1. The **USB camera is chosen for you**. Devices are named through
+   AVFoundation and ranked external → built-in → iPhone, because an overhead
+   scanner is an external camera and index 0 is usually the laptop webcam
+   pointing at your face.
+2. The preview appears in about two seconds at whatever the camera streams by
+   default, then climbs to the full sensor mode a moment later. The badge in
+   the top bar turns green at the maximum, amber below it, and **Try 16 MP**
+   asks again.
+3. Put a page down. A green outline shows the page it found.
+4. **Capture** (Space), or tick **Auto** to shoot whenever the scene goes
+   still — the page-turn workflow.
+5. Pick a filter, adjust if needed, then **Save image** (⌘S) or **Save PDF**
+   (⌘P).
 
-The footer reads `live 4656×3496  crop → 1632×2155  ≈184 dpi`. That dpi figure
+The footer reads `live 4656×3496 · crop 4623×3687 · ≈403 dpi`. That dpi figure
 is the one to watch: it is what an A4 sheet would come out at, and it tells you
 whether small print will survive before you scan a stack.
+
+### Keys
+
+`Space` capture · `C` corners · `D` detect · `A` auto · `[` `]` rotate ·
+`←` `→` page · `⌫` delete · `⌘S` image · `⌘P` PDF · `⌘R` start/stop
 
 ### Filters
 
@@ -60,19 +78,19 @@ whether small print will survive before you scan a stack.
 | **Ink boost** | Pencil, faded carbon, faint print. |
 | **Photo** | Barely touches the image. |
 
-Every filter is a preset over the sliders below it; nudge anything and it
-switches to *custom*.
+Every filter is a preset over the sliders below it; nudge anything and the
+value turns blue and the filter drops to *custom*.
 
 ### Getting a sharp scan
 
 - **Fill the frame with the page.** This is the single biggest lever and the
   easiest to overlook. A crop is only as sharp as the sensor pixels that landed
   on it: 16 MP of a page covering a third of the frame yields a ~1400 px scan,
-  and nothing downstream puts detail back. Capture warns when the page covers
-  less than about half the frame.
+  and nothing downstream puts detail back. The footer shows what percentage of
+  the frame the page fills and warns below about a third.
 - **A desk that isn't paper-coloured** makes detection close to perfect.
 - If the page isn't found the footer says so and the whole frame is kept — it
-  never guesses. Use **Corners** and drag the four handles.
+  never guesses. Press **Corners** and drag the four handles.
 
 ---
 
@@ -95,14 +113,34 @@ PDF's invisible text layer.
 
 ```
 scanner.py     the app: window, preview loop, pages, export
+qtui.py        theme, custom widgets, the preview/corner-drag canvas
 camera.py      device discovery and full-resolution capture
 detect.py      page detection, homography, perspective warp
 imaging.py     the processing pipeline
 ocr.py         Tesseract wrapper, degrades cleanly when absent
 pdfwriter.py   PDF writer with an invisible OCR text layer
-selftest.py    end-to-end check against a real camera
-uitest.py      drives the real UI headlessly
+selftest.py    engine, end to end, against a real camera
+uitest.py      the real App class, driven off-screen
+tools_listcams.swift   index → camera name; compiled to ./listcams on first run
 ```
+
+### Three things worth knowing before editing `camera.py`
+
+**Never probe a camera you are about to use.** Opening and releasing a device
+is all a resolution probe does, and this camera then refuses its 16 MP mode for
+several seconds afterwards. An earlier version enumerated devices by probing
+each one, and that probe was itself the reason the camera that had just
+reported 4656×3496 handed back 1920×1080 when the app opened it. Enumeration
+now reads names from AVFoundation and opens nothing.
+
+**One mode request per session.** A mode change this camera declines does not
+merely fail, it wedges the session — nothing comes back afterwards, not even
+the mode that was working a second earlier. The version that walked a ladder of
+six resolutions looking for a smaller one turned a recoverable stumble into a
+camera that returned nothing at all.
+
+**Let it settle before asking.** Measured: requesting 16 MP 0.6 s after opening
+fails about half the time; at 1.2 s the same request is answered in 0.1 s.
 
 ### Two things worth knowing before editing `imaging.py`
 
@@ -135,22 +173,27 @@ nothing rather than guessing.
 
 ```bash
 python3 selftest.py     # camera -> capture -> detect -> filters -> PDF
-python3 uitest.py       # the real App class, headless
+python3 uitest.py       # the real App class, off-screen
 ```
 
-Both need the camera connected. `uitest.py` builds real Tk widgets in a
-withdrawn window and drives capture, filters, sliders, corner dragging and
-export, so the UI wiring is covered rather than just the libraries under it.
+Both need the camera connected, and neither should be run while the app is
+open — they compete for the device. `uitest.py` builds real Qt widgets in an
+off-screen window and drives capture, filters, sliders, corner dragging, export
+and page management, so the UI wiring is covered rather than just the libraries
+under it.
 
 ---
 
 ## Known limits
 
-- **~5–10 fps preview at 16 MP.** That is the camera's own frame rate in that
+- **~8–10 fps preview at 16 MP.** That is the camera's own frame rate in that
   mode, not the app's. Fine for documents; it is not a video app.
-- **Device indices shift** when cameras are plugged in or out, and a camera
-  released moments earlier can briefly report a lower maximum. Enumeration
-  re-probes each time, so use the dropdown rather than assuming index 0.
+- **The camera is genuinely erratic about its top mode.** It will refuse 16 MP
+  for a few seconds after anything else has had it — including the app's own
+  previous run. The app opens low, upgrades, and offers **Try 16 MP**; if that
+  fails twice, unplug it and back in.
+- **Device indices shift** when cameras are plugged in or out, so the list is
+  re-read on every Rescan rather than remembered.
 - **No auto-orientation.** A page placed upside down is captured upside down;
   the rotate buttons fix it. Detecting text orientation needs OCR.
 - **Curved book spines aren't dewarped** — a quadrilateral can't model a curl.

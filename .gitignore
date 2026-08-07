@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Built on first run from tools_listcams.swift
+listcams

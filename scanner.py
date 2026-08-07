@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Overhead Scanner — desktop app.
+"""Overhead Scanner — desktop app for a document camera.
 
     python3 scanner.py
 
@@ -12,892 +12,1181 @@ import os
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QMainWindow, QMessageBox,
+                               QScrollArea, QTabWidget, QTextEdit, QVBoxLayout,
+                               QWidget)
 
 import camera
 import detect
 import imaging
 import ocr
 import pdfwriter
+import qtui
+from qtui import (ACCENT, BAD, BG, FG, FG2, FG3, GOOD, LINE, PANEL, PANEL2, QSS,
+                  WARN, PreviewView, Section, SliderRow, Toast, button, hair,
+                  label, spacer, to_qimage)
 
-BG      = "#0d1014"
-PANEL   = "#141920"
-LINE    = "#262e3a"
-FG      = "#e6ecf3"
-FG2     = "#97a3b4"
-FG3     = "#63707f"
-ACCENT  = "#4da3ff"
-GOOD    = "#35d39a"
-BAD     = "#ff6b6b"
+PREVIEW_MS   = 70            # display refresh; the camera itself runs ~10 fps
+DETECT_EVERY = 0.40          # seconds between live page detections
+EDIT_MAX     = 1700          # long edge the editor previews at
+THUMB        = QSize(112, 140)
+A4_INCHES    = 11.69         # long edge, for the dpi readout
 
-PREVIEW_FPS = 8
-DETECT_EVERY = 0.45          # seconds between live detections
-THUMB_W = 150
+FILTERS = [("auto", "Auto"), ("original", "Original"),
+           ("color", "Colour doc"), ("gray", "Greyscale"),
+           ("bw", "Black & white"), ("whiteboard", "Whiteboard"),
+           ("ink", "Ink boost"), ("photo", "Photo")]
+
+SLIDERS = [
+    ("Lighting", [("flatten", "Shadow removal", 0, 100, 0),
+                  ("temp", "Temperature", -100, 100, 0),
+                  ("tint", "Tint", -100, 100, 0)]),
+    ("Tone", [("exposure", "Exposure", -100, 100, 0),
+              ("contrast", "Contrast", -100, 100, 0),
+              ("gamma", "Gamma", 0.3, 3.0, 2),
+              ("highlights", "Highlights", -100, 100, 0),
+              ("shadows", "Shadows", -100, 100, 0)]),
+    ("Colour & detail", [("saturation", "Saturation", -100, 100, 0),
+                         ("vibrance", "Vibrance", -100, 100, 0),
+                         ("denoise", "Denoise", 0, 100, 0),
+                         ("sharpen", "Sharpen", 0, 150, 0)]),
+    ("Black & white", [("threshold", "Threshold bias", -50, 50, 0),
+                       ("window", "Local window", 20, 300, 0)]),
+    ("Geometry", [("straighten", "Straighten", -15, 15, 1)]),
+]
+
+OUTSIZES = [("detected", "Fit detected page"), ("native", "Original pixels"),
+            ("a4", "A4 · 300 dpi"), ("letter", "Letter · 300 dpi")]
 
 
 class Page:
-    __slots__ = ("frame", "corners", "adjust", "thumb", "name", "ocr")
+    __slots__ = ("frame", "corners", "adjust", "name", "ocr")
 
     def __init__(self, frame, corners, adjust, name):
-        self.frame = frame           # full-resolution BGR, pristine
+        self.frame = frame              # full-resolution BGR, pristine
         self.corners = corners
         self.adjust = adjust
-        self.thumb = None
         self.name = name
         self.ocr = None
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title("Overhead Scanner")
-        root.configure(bg=BG)
-        root.geometry("1400x880")
-        root.minsize(1100, 700)
+class Job(QObject):
+    """Run one callable off the GUI thread and deliver its result back on it.
+
+    Everything slow in this app — opening a camera, processing 16 MP, OCR,
+    writing a PDF — has to leave the GUI thread or the window stops repainting,
+    which is exactly the failure the previous build shipped with.
+    """
+
+    done = Signal(object, object)       # result, error
+
+    def run(self, fn, *args, **kwargs):
+        def work():
+            try:
+                self.done.emit(fn(*args, **kwargs), None)
+            except Exception as exc:                # noqa: BLE001 - reported in UI
+                self.done.emit(None, exc)
+        threading.Thread(target=work, daemon=True).start()
+        return self
+
+
+class App(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Overhead Scanner")
+        self.resize(1480, 940)
+        self.setMinimumSize(1120, 720)
 
         self.cam = camera.Camera()
+        self.devices = []
         self.pages = []
         self.current = -1
-        self.mode = "live"           # live | edit
-        self.corner_mode = False
+        self.mode = "live"
+        self.busy = False
+        self.auto = False
+        self.live = False           # camera was running and has not been stopped
+        self._retries = 0
+        self._upgrade_tried = False
+        self._scanning = False
+
         self.live_quad = None
-        self._quad_smooth = None
         self._quad_miss = 0
         self._last_detect = 0.0
-        self._preview_img = None
-        self._drag_corner = -1
-        self._view = None            # (x, y, w, h) of the image inside the canvas
-        self._busy = False
-        self._auto_last = 0.0
-        self._scene_dirty = False
-        self._still_since = 0.0
+        self._last_seq = -1
         self._prev_small = None
-        self._render_token = 0
-        self._edit_cache = None
-
-        self.var = {}
-        self._build_ui()
-        self._tick()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ── construction ─────────────────────────────────────────────
-
-    def _build_ui(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("TScale", background=PANEL, troughcolor=LINE)
-        style.configure("TCombobox", fieldbackground=LINE, background=LINE)
-
-        top = tk.Frame(self.root, bg=PANEL, height=46)
-        top.pack(side="top", fill="x")
-        top.pack_propagate(False)
-
-        tk.Label(top, text="Overhead Scanner", bg=PANEL, fg=FG,
-                 font=("Helvetica", 13, "bold")).pack(side="left", padx=12)
-
-        tk.Label(top, text="Camera", bg=PANEL, fg=FG2).pack(side="left", padx=(14, 4))
-        self.device_box = ttk.Combobox(top, width=22, state="readonly", values=[])
-        self.device_box.pack(side="left")
-
-        self.btn_start = tk.Button(top, text="Start camera", command=self.toggle_camera,
-                                   bg=ACCENT, fg="#04101f", relief="flat",
-                                   activebackground="#7fc0ff", padx=12, pady=3,
-                                   font=("Helvetica", 11, "bold"))
-        self.btn_start.pack(side="left", padx=10)
-
-        self.lbl_status = tk.Label(top, text="off", bg=PANEL, fg=FG3)
-        self.lbl_status.pack(side="left")
-
-        self.lbl_res = tk.Label(top, text="", bg=PANEL, fg=GOOD,
-                                font=("Helvetica", 11, "bold"))
-        self.lbl_res.pack(side="right", padx=14)
-
-        body = tk.Frame(self.root, bg=BG)
-        body.pack(side="top", fill="both", expand=True)
-
-        # ── tray ──
-        tray = tk.Frame(body, bg=PANEL, width=THUMB_W + 34)
-        tray.pack(side="left", fill="y")
-        tray.pack_propagate(False)
-        head = tk.Frame(tray, bg=PANEL)
-        head.pack(fill="x", pady=6, padx=8)
-        self.lbl_pages = tk.Label(head, text="Pages 0", bg=PANEL, fg=FG2)
-        self.lbl_pages.pack(side="left")
-        self._small_btn(head, "Import", self.import_images).pack(side="right")
-
-        wrap = tk.Frame(tray, bg=PANEL)
-        wrap.pack(fill="both", expand=True)
-        self.tray_canvas = tk.Canvas(wrap, bg=PANEL, highlightthickness=0,
-                                     width=THUMB_W + 16)
-        sb = tk.Scrollbar(wrap, orient="vertical", command=self.tray_canvas.yview)
-        self.tray_canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.tray_canvas.pack(side="left", fill="both", expand=True)
-        self.tray_inner = tk.Frame(self.tray_canvas, bg=PANEL)
-        self.tray_canvas.create_window((0, 0), window=self.tray_inner, anchor="nw")
-        self.tray_inner.bind("<Configure>", lambda e: self.tray_canvas.configure(
-            scrollregion=self.tray_canvas.bbox("all")))
-
-        # ── stage ──
-        stage = tk.Frame(body, bg=BG)
-        stage.pack(side="left", fill="both", expand=True)
-
-        bar = tk.Frame(stage, bg=PANEL, height=42)
-        bar.pack(side="top", fill="x")
-        bar.pack_propagate(False)
-        self.btn_live = self._small_btn(bar, "Live", lambda: self.set_mode("live"))
-        self.btn_live.pack(side="left", padx=(10, 2), pady=6)
-        self.btn_edit = self._small_btn(bar, "Edit", lambda: self.set_mode("edit"))
-        self.btn_edit.pack(side="left", padx=2)
-
-        self.btn_capture = tk.Button(bar, text="●  Capture", command=self.capture,
-                                     bg="#c8443f", fg="white", relief="flat",
-                                     activebackground="#e05a55", padx=16, pady=3,
-                                     font=("Helvetica", 11, "bold"))
-        self.btn_capture.pack(side="left", padx=16)
-
-        self.var["autocap"] = tk.BooleanVar(value=False)
-        tk.Checkbutton(bar, text="Auto", variable=self.var["autocap"], bg=PANEL,
-                       fg=FG2, selectcolor=LINE, activebackground=PANEL,
-                       activeforeground=FG).pack(side="left")
-
-        self._small_btn(bar, "Corners", self.toggle_corners).pack(side="right", padx=4)
-        self._small_btn(bar, "Detect", self.redetect).pack(side="right", padx=4)
-        self._small_btn(bar, "Delete", self.delete_page).pack(side="right", padx=4)
-
-        self.canvas = tk.Canvas(stage, bg="#0a0d11", highlightthickness=0)
-        self.canvas.pack(side="top", fill="both", expand=True)
-        self.canvas.bind("<Button-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-
-        foot = tk.Frame(stage, bg=PANEL, height=26)
-        foot.pack(side="bottom", fill="x")
-        foot.pack_propagate(False)
-        self.lbl_info = tk.Label(foot, text="", bg=PANEL, fg=FG3, anchor="w")
-        self.lbl_info.pack(side="left", padx=10)
-        self.lbl_hint = tk.Label(foot, text="", bg=PANEL, fg=ACCENT, anchor="e")
-        self.lbl_hint.pack(side="right", padx=10)
-
-        # ── inspector ──
-        insp = tk.Frame(body, bg=PANEL, width=310)
-        insp.pack(side="right", fill="y")
-        insp.pack_propagate(False)
-        self._build_inspector(insp)
-
-        # Probing each camera's maximum takes a few seconds; let the window
-        # appear first so it doesn't look like a hang, then start the camera
-        # without waiting to be asked — the app has exactly one purpose.
-        self.root.after(150, self._startup)
-
-    def _startup(self):
-        self.refresh_devices()
-        if self.devices:
-            self.root.after(50, self.toggle_camera)
-
-    def _small_btn(self, parent, text, cmd):
-        return tk.Button(parent, text=text, command=cmd, bg=LINE, fg=FG,
-                         relief="flat", activebackground="#2c3542",
-                         activeforeground=FG, padx=10, pady=2)
-
-    def _section(self, parent, title):
-        tk.Label(parent, text=title.upper(), bg=PANEL, fg=FG3, anchor="w",
-                 font=("Helvetica", 9, "bold")).pack(fill="x", padx=12, pady=(12, 4))
-        f = tk.Frame(parent, bg=PANEL)
-        f.pack(fill="x", padx=12)
-        return f
-
-    def _slider(self, parent, key, label, lo, hi, step=1, fmt="%.0f"):
-        row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x", pady=1)
-        var = tk.DoubleVar(value=imaging.DEFAULTS.get(key, 0))
-        self.var[key] = var
-        lab = tk.Label(row, text=label, bg=PANEL, fg=FG2, anchor="w", width=17,
-                       font=("Helvetica", 10))
-        lab.pack(side="left")
-        val = tk.Label(row, text=fmt % var.get(), bg=PANEL, fg=FG, width=5,
-                       anchor="e", font=("Helvetica", 10))
-        val.pack(side="right")
-
-        def on_change(_v):
-            val.configure(text=fmt % var.get())
-            self._apply_adjust(key, var.get())
-
-        s = ttk.Scale(row, from_=lo, to=hi, variable=var, command=on_change,
-                      orient="horizontal")
-        s.pack(side="right", fill="x", expand=True, padx=6)
-        return var
-
-    def _build_inspector(self, insp):
-        f = self._section(insp, "Filter")
-        grid = tk.Frame(f, bg=PANEL)
-        grid.pack(fill="x")
+        self._still_since = 0.0
+        self._auto_last = 0.0
+        self._jobs = []
+        self.sliders = {}
         self.filter_buttons = {}
-        names = [("original", "Original"), ("auto", "Auto"), ("color", "Colour doc"),
-                 ("gray", "Greyscale"), ("bw", "Black & white"), ("whiteboard", "Whiteboard"),
-                 ("ink", "Ink boost"), ("photo", "Photo")]
-        for i, (key, label) in enumerate(names):
-            b = tk.Button(grid, text=label, relief="flat", bg=LINE, fg=FG2,
-                          activebackground="#2c3542", font=("Helvetica", 10),
-                          command=lambda k=key: self.set_filter(k))
-            b.grid(row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
-            self.filter_buttons[key] = b
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
 
-        f = self._section(insp, "Geometry")
-        row = tk.Frame(f, bg=PANEL); row.pack(fill="x")
-        self._small_btn(row, "↺ 90", lambda: self.rotate(-90)).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row, "↻ 90", lambda: self.rotate(90)).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row, "Flip H", lambda: self.flip("fliph")).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row, "Flip V", lambda: self.flip("flipv")).pack(side="left", expand=True, fill="x", padx=1)
-        self._slider(f, "straighten", "Straighten", -15, 15, fmt="%.1f")
-
-        f = self._section(insp, "Lighting")
-        self._slider(f, "flatten", "Shadow removal", 0, 100)
-        self._slider(f, "temp", "Temperature", -100, 100)
-        self._slider(f, "tint", "Tint", -100, 100)
-
-        f = self._section(insp, "Tone")
-        self._slider(f, "exposure", "Exposure", -100, 100)
-        self._slider(f, "contrast", "Contrast", -100, 100)
-        self._slider(f, "gamma", "Gamma", 0.3, 3.0, fmt="%.2f")
-        self._slider(f, "highlights", "Highlights", -100, 100)
-        self._slider(f, "shadows", "Shadows", -100, 100)
-
-        f = self._section(insp, "Colour & detail")
-        self._slider(f, "saturation", "Saturation", -100, 100)
-        self._slider(f, "vibrance", "Vibrance", -100, 100)
-        self._slider(f, "denoise", "Denoise", 0, 100)
-        self._slider(f, "sharpen", "Sharpen", 0, 150)
-
-        f = self._section(insp, "Black & white")
-        self._slider(f, "threshold", "Threshold bias", -50, 50)
-        self._slider(f, "window", "Local window", 20, 300)
-
-        f = self._section(insp, "OCR")
-        row = tk.Frame(f, bg=PANEL); row.pack(fill="x", pady=2)
-        self._small_btn(row, "Read page", self.run_ocr).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row, "Read all", self.run_ocr_all).pack(side="left", expand=True, fill="x", padx=1)
-        self.lbl_ocr = tk.Label(f, text="", bg=PANEL, fg=FG3, anchor="w",
-                                wraplength=280, justify="left", font=("Helvetica", 9))
-        self.lbl_ocr.pack(fill="x", pady=2)
-        self.txt_ocr = tk.Text(f, height=7, bg=LINE, fg=FG, insertbackground=FG,
-                               relief="flat", wrap="word", font=("Menlo", 9))
-        self.txt_ocr.pack(fill="x", pady=2)
-        if not ocr.available():
-            self.lbl_ocr.configure(text="Tesseract not installed — text export and "
-                                        "searchable PDF are unavailable. brew install tesseract",
-                                   fg="#ffb648")
-
-        f = self._section(insp, "Export")
-        row = tk.Frame(f, bg=PANEL); row.pack(fill="x", pady=2)
-        self._small_btn(row, "Save image", self.export_image).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row, "Save PDF", self.export_pdf).pack(side="left", expand=True, fill="x", padx=1)
-        row2 = tk.Frame(f, bg=PANEL); row2.pack(fill="x", pady=2)
-        self._small_btn(row2, "Apply to all pages", self.apply_all).pack(side="left", expand=True, fill="x", padx=1)
-        self._small_btn(row2, "Save text", self.export_text).pack(side="left", expand=True, fill="x", padx=1)
-        self.lbl_export = tk.Label(f, text="", bg=PANEL, fg=FG3, anchor="w",
-                                   wraplength=280, justify="left",
-                                   font=("Helvetica", 9))
-        self.lbl_export.pack(fill="x", pady=4)
-
-    # ── camera ───────────────────────────────────────────────────
-
-    def refresh_devices(self):
-        self.lbl_status.configure(text="scanning…", fg=FG3)
-        self.root.update_idletasks()
-        devs = camera.Camera.list_devices()
-        # Highest-resolution device first: on a laptop with a built-in webcam
-        # the document camera is rarely index 0, and picking by index would
-        # quietly hand you 1080p from the wrong camera.
-        devs.sort(key=lambda d: d["max_width"] * d["max_height"], reverse=True)
-        self.devices = devs
-        labels = ["Camera %d — up to %d×%d" % (d["index"], d["max_width"], d["max_height"])
-                  for d in devs]
-        self.device_box.configure(values=labels)
-        if labels:
-            self.device_box.current(0)
-            self.lbl_status.configure(text="ready", fg=FG3)
-        else:
-            self.lbl_status.configure(text="no camera", fg=BAD)
-
-    def toggle_camera(self):
-        if self.cam.is_open():
-            self.cam.close()
-            self.btn_start.configure(text="Start camera")
-            self.lbl_status.configure(text="off", fg=FG3)
-            self.lbl_res.configure(text="")
-            return
-        if not self.devices:
-            self.refresh_devices()
-            if not self.devices:
-                return
-        sel = self.devices[max(0, self.device_box.current())]
-        idx = sel["index"]
-        self.lbl_status.configure(text="opening…", fg=FG3)
-        self.root.update_idletasks()
-        detect.reset_sticky()
-        if not self.cam.open(idx, prefer=(sel["max_width"], sel["max_height"])):
-            self.lbl_status.configure(text="failed", fg=BAD)
-            messagebox.showerror("Camera", self.cam.error or "could not open the camera")
-            return
-        self.btn_start.configure(text="Stop camera")
-        self.lbl_status.configure(text="live", fg=GOOD)
-        self.lbl_res.configure(text="%d × %d" % (self.cam.width, self.cam.height))
+        self._build()
+        self._sync_controls()
         self.set_mode("live")
 
-    # ── the loop ─────────────────────────────────────────────────
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(PREVIEW_MS)
+
+        self.repro = QTimer(self)
+        self.repro.setSingleShot(True)
+        self.repro.timeout.connect(self._render_page)
+
+        QTimer.singleShot(120, self.rescan)
+
+    # ══ layout ═══════════════════════════════════════════════════
+
+    def _build(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        col = QVBoxLayout(root)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        col.addWidget(self._topbar())
+        col.addWidget(hair())
+
+        body = QWidget()
+        row = QHBoxLayout(body)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(self._tray())
+        row.addWidget(hair(vertical=True))
+        row.addWidget(self._stage(), 1)
+        row.addWidget(hair(vertical=True))
+        row.addWidget(self._inspector())
+        col.addWidget(body, 1)
+
+        self.toast = Toast(self.preview)
+        self._shortcuts()
+
+    def _topbar(self):
+        bar = QWidget()
+        bar.setObjectName("topbar")
+        bar.setFixedHeight(56)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setSpacing(8)
+
+        lay.addWidget(label("Overhead Scanner", "title"))
+        lay.addSpacing(18)
+
+        lay.addWidget(label("Camera", "muted"))
+        self.device_box = QComboBox()
+        self.device_box.setMinimumWidth(230)
+        self.device_box.currentIndexChanged.connect(self._device_changed)
+        lay.addWidget(self.device_box)
+
+        self.btn_start = button("Start", self.toggle_camera, kind="primary",
+                                tip="Open the selected camera  (⌘R restarts)")
+        lay.addWidget(self.btn_start)
+        lay.addWidget(button("Rescan", self.rescan, kind="ghost",
+                             tip="Look for cameras again"))
+
+        lay.addWidget(spacer())
+
+        self.btn_upgrade = button("Try 16 MP", self.upgrade_camera, kind="ghost",
+                                  tip="Ask the camera for its top mode again")
+        self.btn_upgrade.hide()
+        lay.addWidget(self.btn_upgrade)
+        self.lbl_state = label("", "muted")
+        lay.addWidget(self.lbl_state)
+        self.lbl_res = label("", "badge")
+        lay.addWidget(self.lbl_res)
+        return bar
+
+    def _tray(self):
+        panel = QWidget()
+        panel.setObjectName("panel")
+        panel.setFixedWidth(168)
+        col = QVBoxLayout(panel)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        head = QWidget()
+        head.setObjectName("panel")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(14, 12, 10, 8)
+        self.lbl_pages = label("Pages", "heading")
+        hl.addWidget(self.lbl_pages)
+        hl.addStretch(1)
+        add = button("＋", self.import_images, kind="ghost", tip="Import images")
+        add.setFixedWidth(28)
+        hl.addWidget(add)
+        col.addWidget(head)
+
+        self.tray = QListWidget()
+        self.tray.setIconSize(THUMB)
+        self.tray.setViewMode(QListWidget.IconMode)
+        self.tray.setFlow(QListWidget.TopToBottom)
+        self.tray.setWrapping(False)
+        self.tray.setResizeMode(QListWidget.Adjust)
+        self.tray.setMovement(QListWidget.Static)
+        self.tray.setSpacing(2)
+        self.tray.currentRowChanged.connect(self._tray_changed)
+        col.addWidget(self.tray, 1)
+
+        foot = QWidget()
+        foot.setObjectName("panel")
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(12, 6, 12, 12)
+        fl.addWidget(button("Clear all", self.clear_pages, kind="ghost"))
+        col.addWidget(foot)
+        return panel
+
+    def _stage(self):
+        wrap = QWidget()
+        col = QVBoxLayout(wrap)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        bar = QWidget()
+        bar.setObjectName("bar")
+        bar.setFixedHeight(52)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(6)
+
+        self.btn_live = button("Live", lambda: self.set_mode("live"), checkable=True)
+        self.btn_edit = button("Edit", lambda: self.set_mode("edit"), checkable=True)
+        lay.addWidget(self.btn_live)
+        lay.addWidget(self.btn_edit)
+        lay.addWidget(spacer())
+
+        self.btn_capture = button("●   Capture", self.capture, kind="record",
+                                  tip="Keep the current frame  (Space)")
+        lay.addWidget(self.btn_capture)
+        self.btn_auto = button("Auto", self.toggle_auto, checkable=True,
+                               tip="Capture whenever the scene goes still")
+        lay.addWidget(self.btn_auto)
+        lay.addWidget(spacer())
+
+        self.btn_corners = button("Corners", self.toggle_corners, checkable=True,
+                                  tip="Drag the four page corners  (C)")
+        lay.addWidget(self.btn_corners)
+        lay.addWidget(button("Detect", self.redetect, tip="Find the page again  (D)"))
+        lay.addWidget(button("Delete", self.delete_page, kind="ghost", tip="⌫"))
+        col.addWidget(bar)
+        col.addWidget(hair())
+
+        self.preview = PreviewView()
+        self.preview.corners_changed.connect(self._corners_dragged)
+        col.addWidget(self.preview, 1)
+
+        col.addWidget(hair())
+        foot = QWidget()
+        foot.setObjectName("bar")
+        foot.setFixedHeight(30)
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(14, 0, 14, 0)
+        self.lbl_info = label("", "note")
+        fl.addWidget(self.lbl_info)
+        fl.addStretch(1)
+        self.lbl_hint = label("", "note")
+        fl.addWidget(self.lbl_hint)
+        col.addWidget(foot)
+        return wrap
+
+    def _inspector(self):
+        tabs = QTabWidget()
+        tabs.setFixedWidth(322)
+        tabs.addTab(self._scroll(self._adjust_tab()), "Adjust")
+        tabs.addTab(self._scroll(self._export_tab()), "Export")
+        return tabs
+
+    @staticmethod
+    def _scroll(inner):
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        area.setWidget(inner)
+        return area
+
+    def _adjust_tab(self):
+        page = QWidget()
+        page.setObjectName("panel")
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 16)
+        col.setSpacing(0)
+
+        sec = Section("Filter")
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        for i, (key, text) in enumerate(FILTERS):
+            b = button(text, lambda k=key: self.set_filter(k), checkable=True)
+            grid.addWidget(b, i // 2, i % 2)
+            self.filter_buttons[key] = b
+        sec.add_layout(grid)
+        col.addWidget(sec)
+
+        sec = Section("Rotate & flip")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for text, tip, fn in (("↺", "Rotate left  ([)", lambda: self.rotate(-90)),
+                              ("↻", "Rotate right  (])", lambda: self.rotate(90)),
+                              ("⇋", "Flip horizontally", lambda: self.flip("fliph")),
+                              ("⇵", "Flip vertically", lambda: self.flip("flipv"))):
+            row.addWidget(button(text, fn, tip=tip))
+        sec.add_layout(row)
+        col.addWidget(sec)
+
+        sec = Section("Output size")
+        self.outsize = QComboBox()
+        for _key, text in OUTSIZES:
+            self.outsize.addItem(text)
+        self.outsize.currentIndexChanged.connect(self._outsize_changed)
+        sec.add(self.outsize)
+        col.addWidget(sec)
+
+        for title, items in SLIDERS:
+            col.addWidget(hair())
+            sec = Section(title)
+            for key, text, lo, hi, dec in items:
+                row = SliderRow(key, text, lo, hi, imaging.DEFAULTS[key], dec)
+                row.changed.connect(self._slider_changed)
+                self.sliders[key] = sec.add(row)
+            col.addWidget(sec)
+
+        col.addWidget(hair())
+        sec = Section("All pages")
+        sec.add(button("Apply these settings to every page", self.apply_all))
+        col.addWidget(sec)
+        col.addStretch(1)
+        return page
+
+    def _export_tab(self):
+        page = QWidget()
+        page.setObjectName("panel")
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 16)
+        col.setSpacing(0)
+
+        sec = Section("This page")
+        sec.add(button("Save image…", self.export_image, kind="primary",
+                       tip="⌘S"))
+        note = label("Always the full resolution of the crop. JPEG is written at "
+                     "quality 98; choose PNG or TIFF for no compression at all.",
+                     "note")
+        note.setWordWrap(True)
+        sec.add(note)
+        col.addWidget(sec)
+
+        col.addWidget(hair())
+        sec = Section("All pages")
+        sec.add(button("Save PDF…", self.export_pdf, kind="primary", tip="⌘P"))
+        sec.add(button("Save text…", self.export_text))
+        col.addWidget(sec)
+
+        col.addWidget(hair())
+        sec = Section("OCR")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(button("Read page", self.run_ocr))
+        row.addWidget(button("Read all", self.run_ocr_all))
+        sec.add_layout(row)
+        self.lbl_ocr = label("", "note")
+        self.lbl_ocr.setWordWrap(True)
+        sec.add(self.lbl_ocr)
+        self.txt_ocr = QTextEdit()
+        self.txt_ocr.setMinimumHeight(220)
+        # Read-only for a reason beyond the obvious: an editable field swallows
+        # the single-key shortcuts (Space, C, D) the rest of the app runs on.
+        self.txt_ocr.setReadOnly(True)
+        sec.add(self.txt_ocr)
+        if not ocr.available():
+            self.lbl_ocr.setText(ocr.install_hint())
+            self.lbl_ocr.setStyleSheet("color: %s;" % WARN)
+        col.addWidget(sec)
+        col.addStretch(1)
+        return page
+
+    def _shortcuts(self):
+        def act(seq, fn):
+            a = QAction(self)
+            a.setShortcut(QKeySequence(seq))
+            a.triggered.connect(lambda *_: fn())
+            self.addAction(a)
+
+        act("Space", self.capture)
+        act("C", self.toggle_corners)
+        act("D", self.redetect)
+        act("A", self.toggle_auto)
+        act("[", lambda: self.rotate(-90))
+        act("]", lambda: self.rotate(90))
+        act("Backspace", self.delete_page)
+        act("Ctrl+S", self.export_image)
+        act("Ctrl+P", self.export_pdf)
+        act("Ctrl+R", self.toggle_camera)
+        act("Left", lambda: self.step_page(-1))
+        act("Right", lambda: self.step_page(1))
+
+    # ══ camera ═══════════════════════════════════════════════════
+
+    def rescan(self):
+        """Re-enumerate. Cheap and safe: it opens no camera at all.
+
+        That matters more than it sounds. An earlier version measured each
+        device's maximum by opening it, and the opening itself left this camera
+        refusing its 16 MP mode for the next few seconds — so the app that had
+        just been told "4656x3496" would then settle at 1080p.
+
+        Off the GUI thread all the same: the very first run may have to compile
+        the little AVFoundation name helper.
+        """
+        if self._scanning:
+            return
+        self._scanning = True
+        self.lbl_state.setText("looking for cameras…")
+        self._job(camera.Camera.list_devices)(self._devices_listed)
+
+    def _devices_listed(self, devices, err):
+        self._scanning = False
+        if err is not None:
+            self.lbl_state.setText("could not list cameras")
+            self.toast.show_message(str(err), "bad")
+            return
+        was = self.device_box.currentData()
+        self.devices = devices or []
+        self.device_box.blockSignals(True)
+        self.device_box.clear()
+        for d in self.devices:
+            tag = {"external": "USB", "builtin": "built-in",
+                   "continuity": "iPhone"}.get(d["kind"], "")
+            text = "%s  ·  %s" % (d["name"], tag) if tag else d["name"]
+            self.device_box.addItem(text, d["index"])
+        if was is not None:
+            i = self.device_box.findData(was)
+            if i >= 0:
+                self.device_box.setCurrentIndex(i)
+        self.device_box.blockSignals(False)
+
+        if not self.devices:
+            self.lbl_state.setText("no camera found")
+            self.preview.set_placeholder("No camera found.\nPlug one in, then press Rescan.")
+            return
+        self.lbl_state.setText("%d camera%s" % (len(self.devices),
+                                                "" if len(self.devices) == 1 else "s"))
+        if not self.cam.is_open():
+            self.start_camera()
+
+    def toggle_camera(self):
+        self.stop_camera() if self.cam.is_open() else self.start_camera()
+
+    def start_camera(self):
+        if self.busy or not self.devices:
+            return
+        index = self.device_box.currentData()
+        name = self.device_box.currentText().split("  ·")[0]
+        self.busy = True
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("Opening…")
+        self.lbl_state.setText("bringing up %s" % name)
+        self.preview.set_placeholder("Opening %s…\nFirst frame takes a few seconds "
+                                     "at full resolution." % name)
+        detect.reset_sticky()
+        # Open at whatever the device streams by default, which it never
+        # refuses and answers in about a second, then climb to the full sensor
+        # mode a moment later. Asking for 16 MP up front is a coin toss on this
+        # camera and costs eight seconds of black window when it loses; this
+        # way there is a picture almost immediately and the resolution arrives
+        # while you are still putting the page down.
+        self._upgrade_tried = False
+        self._job(camera.Camera.open, self.cam, index, name, None)(self._camera_opened)
+
+    RETRIES = 2
+
+    def _camera_opened(self, ok, err):
+        self.busy = False
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("Stop" if ok else "Start")
+        if not ok:
+            msg = self.cam.error or (str(err) if err else "camera did not start")
+            # A failed open is usually not a broken camera, it is an impatient
+            # one: this device refuses its top mode for a few seconds after
+            # anything else has had it, so a rest and a retry is the fix, and
+            # making the operator press the button again is just theatre.
+            if self._retries < self.RETRIES:
+                self._retries += 1
+                self.lbl_state.setText("camera busy — retrying (%d of %d)"
+                                       % (self._retries, self.RETRIES))
+                self.preview.set_placeholder("Camera did not come up.\nGiving it a "
+                                             "moment and trying again…")
+                # Measured: this camera needs a few seconds of being left
+                # alone before it will bring its top mode up again. Retrying
+                # straight away is what makes the second attempt fail too.
+                QTimer.singleShot(4000, self.start_camera)
+                return
+            self._retries = 0
+            self.lbl_state.setText("failed")
+            self.preview.set_placeholder("Could not start the camera.\n%s\n\n"
+                                         "Unplug it and back in, then press Start."
+                                         % msg)
+            self.toast.show_message(msg, "bad")
+            return
+        self._retries = 0
+        self.live = True
+        self.lbl_state.setText(self.cam.name or "")
+        self._update_res()
+        self.set_mode("live")
+        self.toast.show_message("%s · %d×%d" % (self.cam.name, self.cam.width,
+                                                self.cam.height), "good")
+        if not self.cam.at_max and not self._upgrade_tried:
+            QTimer.singleShot(1800, self._auto_upgrade)
+
+    def _auto_upgrade(self):
+        """Climb to the sensor's full mode once, on its own.
+
+        Once only, and never again automatically: a camera whose maximum really
+        is 1080p would otherwise be reopened every few seconds forever. After
+        this the button in the top bar is the way to ask again.
+        """
+        if self._upgrade_tried or self.busy or not self.cam.is_open() or self.cam.at_max:
+            return
+        self._upgrade_tried = True
+        self.upgrade_camera()
+
+    def _update_res(self):
+        self.lbl_res.setText("%d×%d" % (self.cam.width, self.cam.height))
+        top = camera.LADDER[0]
+        below = self.cam.is_open() and not self.cam.at_max
+        self.lbl_res.setStyleSheet("color: %s;" % (WARN if below else GOOD))
+        self.btn_upgrade.setVisible(bool(below))
+        self.btn_upgrade.setToolTip("Camera is at %d×%d; ask for %d×%d again"
+                                    % (self.cam.width, self.cam.height, top[0], top[1]))
+
+    def upgrade_camera(self):
+        if self.busy or not self.cam.is_open():
+            return
+        self.busy = True
+        self.btn_upgrade.setEnabled(False)
+        self.lbl_state.setText("asking for full resolution…")
+        self._job(camera.Camera.upgrade, self.cam)(self._upgraded)
+
+    def _upgraded(self, ok, _err):
+        self.busy = False
+        self.btn_upgrade.setEnabled(True)
+        self.live = self.cam.is_open()
+        self.lbl_state.setText(self.cam.name if self.live else "stopped")
+        self._update_res()
+        self._last_seq = -1
+        if ok:
+            self.toast.show_message("Now at %d×%d" % (self.cam.width, self.cam.height),
+                                    "good")
+        elif self.live:
+            self.toast.show_message(
+                "Camera would not go above %d×%d just now — Try 16 MP again in a "
+                "few seconds" % (self.cam.width, self.cam.height), "warn", 5000)
+        else:
+            self.toast.show_message(self.cam.error or "camera stopped", "bad")
+
+    def stop_camera(self):
+        self.live = False
+        self.cam.close()
+        self.btn_start.setText("Start")
+        self.lbl_res.setText("")
+        self.btn_upgrade.hide()
+        self.live_quad = None
+        self.lbl_state.setText("stopped")
+        if self.mode == "live":
+            self.preview.clear()
+            self.preview.set_placeholder("Camera stopped.\nPress Start.")
+
+    def _device_changed(self, _i):
+        if self.cam.is_open():
+            self.stop_camera()
+            QTimer.singleShot(400, self.start_camera)
+
+    # ══ live loop ════════════════════════════════════════════════
 
     def _tick(self):
-        try:
-            if self.mode == "live" and self.cam.is_open():
-                self._live_frame()
-        except Exception as exc:                       # keep the UI alive
-            self.lbl_hint.configure(text="preview error: %s" % exc)
-        self.root.after(int(1000 / PREVIEW_FPS), self._tick)
-
-    def _live_frame(self):
+        if self.mode != "live":
+            return
+        # Only react to a camera that *was* running and has died. Testing
+        # `cam.error` alone also fires while a failed open is being retried,
+        # and overwrote the reason on screen with a bare "stopped".
+        if self.live and not self.busy and self.cam.error and not self.cam.is_open():
+            msg = self.cam.error
+            self.stop_camera()
+            self.toast.show_message(msg, "bad")
+            return
         frame = self.cam.latest()
         if frame is None:
             return
+        seq = self.cam.sequence()
+        if seq == self._last_seq:
+            return
+        self._last_seq = seq
+
         now = time.time()
-        if now - self._last_detect > DETECT_EVERY:
+        if now - self._last_detect >= DETECT_EVERY:
             self._last_detect = now
-            self._update_quad(detect.detect(frame, sticky=True))
-            self._auto_capture(frame)
-
-        cw = max(1, self.canvas.winfo_width())
-        ch = max(1, self.canvas.winfo_height())
-        small = self._fit_to_canvas(frame, cw, ch)
-        self._show(small)
-        if self.live_quad is not None:
-            self._draw_quad(self.live_quad, handles=False)
-        h, w = frame.shape[:2]
-        out = detect.output_size(self.live_quad, w, h) if self.live_quad is not None else (w, h)
-        dpi = int(round(max(out) / 11.69))
-        self.lbl_info.configure(
-            text="live  %d×%d   crop → %d×%d  ≈%d dpi" %
-                 (w, h, out[0], out[1], dpi))
-        self.lbl_hint.configure(
-            text="page found" if self.live_quad is not None else "no page outline — whole frame")
-
-    def _update_quad(self, q):
-        """Ease towards each reading and hold through a few misses, so the
-        outline stops flickering between frames."""
-        if q is None:
-            self._quad_miss += 1
-            if self._quad_miss > 3:
-                self._quad_smooth = None
-        else:
-            self._quad_miss = 0
-            if self._quad_smooth is None:
-                self._quad_smooth = q
+            small = imaging.fit(frame, 900)
+            quad = detect.detect(small, sticky=True)
+            if quad is not None:
+                self.live_quad = quad
+                self._quad_miss = 0
             else:
-                moved = float(np.abs(q - self._quad_smooth).max())
-                a = 1.0 if moved > 0.05 else 0.4
-                self._quad_smooth = self._quad_smooth + (q - self._quad_smooth) * a
-        self.live_quad = self._quad_smooth
+                self._quad_miss += 1
+                if self._quad_miss > 3:
+                    self.live_quad = None
+            self._check_still(small)
 
-    def _auto_capture(self, frame):
-        if not self.var["autocap"].get():
+        view = imaging.fit(frame, max(640, self.preview.width() * 2))
+        self.preview.set_image(to_qimage(view))
+        self.preview.set_quad(self.live_quad)
+        self._live_info(frame)
+
+    def _live_info(self, frame):
+        h, w = frame.shape[:2]
+        if self.live_quad is None:
+            self.lbl_info.setText("live %d×%d  ·  no page found — the whole frame "
+                                  "will be kept" % (w, h))
+            self.lbl_hint.setText("")
             return
-        small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 48),
-                           interpolation=cv2.INTER_AREA).astype(np.int16)
-        if self._prev_small is not None:
-            motion = float(np.abs(small - self._prev_small).mean()) / 255.0
-            now = time.time()
-            if motion >= 0.03:
-                self._scene_dirty = True
-                self._still_since = 0.0
-            elif self._scene_dirty:
-                if self._still_since == 0.0:
-                    self._still_since = now
-                elif now - self._still_since > 0.6 and now - self._auto_last > 1.5:
-                    self._auto_last = now
-                    self._scene_dirty = False
-                    self._still_since = 0.0
-                    self.capture()
-        self._prev_small = small
+        cw, ch = detect.output_size(self.live_quad, w, h)
+        dpi = max(cw, ch) / A4_INCHES
+        cover = self._quad_area(self.live_quad)
+        self.lbl_info.setText("live %d×%d  ·  crop %d×%d  ·  ≈%d dpi"
+                              % (w, h, cw, ch, round(dpi)))
+        if cover < 0.35:
+            self.lbl_hint.setText("page fills %d%% of the frame — move the camera "
+                                  "closer for a sharper scan" % round(cover * 100))
+            self.lbl_hint.setStyleSheet("color: %s;" % WARN)
+        else:
+            self.lbl_hint.setText("page fills %d%%" % round(cover * 100))
+            self.lbl_hint.setStyleSheet("color: %s;" % FG3)
 
-    # ── display helpers ──────────────────────────────────────────
+    @staticmethod
+    def _quad_area(quad):
+        p = np.asarray(quad, dtype=np.float64)
+        x, y = p[:, 0], p[:, 1]
+        return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2.0
 
-    def _fit_to_canvas(self, img, cw, ch):
-        h, w = img.shape[:2]
-        k = min((cw - 20) / float(w), (ch - 20) / float(h))
-        k = max(0.02, min(k, 1.0))
-        dw, dh = max(1, int(w * k)), max(1, int(h * k))
-        # Straight INTER_AREA: measured at ~16 ms for a 16 MP frame, and
-        # striding first to "save" work is slower, because a strided view is
-        # non-contiguous and OpenCV copies it before resizing.
-        small = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
-        self._view = ((cw - dw) // 2, (ch - dh) // 2, dw, dh)
-        return small
+    def _check_still(self, small):
+        """Auto capture fires once the scene stops moving, not on a timer.
 
-    def _show(self, bgr):
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        self._preview_img = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.canvas.delete("all")
-        x, y, _, _ = self._view
-        self.canvas.create_image(x, y, image=self._preview_img, anchor="nw")
-
-    def _draw_quad(self, quad, handles):
-        if self._view is None or quad is None:
+        A page turn is a burst of change followed by stillness; shooting on
+        stillness is what makes a stack of pages a rhythm rather than a chore.
+        """
+        if not self.auto:
+            self._prev_small = None
             return
-        x, y, w, h = self._view
-        pts = [(x + p[0] * w, y + p[1] * h) for p in quad]
-        colour = ACCENT if handles else GOOD
-        for i in range(4):
-            a, b = pts[i], pts[(i + 1) % 4]
-            self.canvas.create_line(a[0], a[1], b[0], b[1], fill=colour, width=2)
-        if handles:
-            for i, (px, py) in enumerate(pts):
-                r = 7
-                fill = ACCENT if i == self._drag_corner else "white"
-                self.canvas.create_oval(px - r, py - r, px + r, py + r,
-                                        fill=fill, outline=BG, width=2)
+        g = cv2.cvtColor(imaging.fit(small, 240), cv2.COLOR_BGR2GRAY)
+        now = time.time()
+        if self._prev_small is not None and self._prev_small.shape == g.shape:
+            diff = float(np.mean(cv2.absdiff(g, self._prev_small)))
+            if diff > 2.4:
+                self._still_since = now
+            elif (now - self._still_since > 1.1 and now - self._auto_last > 2.6
+                    and self.live_quad is not None):
+                self._auto_last = now
+                self.capture()
+        self._prev_small = g
 
-    # ── pages ────────────────────────────────────────────────────
+    def toggle_auto(self):
+        self.auto = not self.auto
+        self.btn_auto.setChecked(self.auto)
+        self._still_since = time.time()
+        self.toast.show_message("Auto capture on — hold still after each page"
+                                if self.auto else "Auto capture off")
 
-    def cur(self):
-        return self.pages[self.current] if 0 <= self.current < len(self.pages) else None
+    # ══ pages ════════════════════════════════════════════════════
 
     def capture(self):
-        if not self.cam.is_open():
-            messagebox.showinfo("Capture", "Start the camera first.")
+        if self.mode != "live":
+            self.set_mode("live")
             return
-        frame = self.cam.grab()
+        frame = self._fresh_frame()
         if frame is None:
+            self.toast.show_message("No frame to capture", "bad")
             return
-        adjust = dict(self.cur().adjust) if self.cur() else imaging.new_adjust()
-        for k in ("rotate", "fliph", "flipv", "straighten"):
-            adjust[k] = imaging.DEFAULTS[k]
-        # The outline on screen is the crop: same pixels, so it transfers exactly.
-        quad = None if self.live_quad is None else np.array(self.live_quad, copy=True)
-        page = Page(frame, quad, adjust, "page %d" % (len(self.pages) + 1))
+        # The quad on screen is the quad that gets used. Re-running detection on
+        # the captured frame is how the previous build ended up cropping
+        # something other than the outline the operator was looking at.
+        quad = None if self.live_quad is None else self.live_quad.copy()
+        page = Page(frame, quad, imaging.new_adjust(),
+                    "Page %d" % (len(self.pages) + 1))
         self.pages.append(page)
+        self._add_thumb(page)
         self.current = len(self.pages) - 1
-        self._edit_cache = None
+        self.tray.setCurrentRow(self.current)
         self.set_mode("edit")
-        self.refresh_tray()
-        h, w = frame.shape[:2]
-        out = detect.output_size(quad, w, h) if quad is not None else (w, h)
-        cover = int(round(100 * (out[0] * out[1] / float(w * h)) ** 0.5))
-        note = ""
-        if cover < 55:
-            note = "  — page fills only %d%% of the frame, move the camera closer" % cover
-        self.lbl_export.configure(text="captured %d×%d → %d×%d%s"
-                                       % (w, h, out[0], out[1], note))
+        if quad is None:
+            self.toast.show_message("No page found — kept the whole frame. "
+                                    "Use Corners.", "warn")
 
-    def import_images(self):
-        paths = filedialog.askopenfilenames(
-            title="Import images",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"), ("All", "*.*")])
-        for p in paths:
-            data = np.fromfile(p, dtype=np.uint8)
-            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            page = Page(img, detect.detect(img), imaging.new_adjust(),
-                        os.path.basename(p))
-            self.pages.append(page)
-            self.current = len(self.pages) - 1
-        if paths:
-            self._edit_cache = None
-            self.set_mode("edit")
-            self.refresh_tray()
+    def _fresh_frame(self, wait=1.2):
+        """A frame at the resolution the camera says it is running at.
+
+        Belt and braces after a mode change: the app advertises 4656x3496 in
+        the top bar the moment the mode comes up, and a capture in the gap
+        before the next frame arrives would otherwise be silently smaller than
+        the number on screen.
+        """
+        deadline = time.time() + wait
+        while True:
+            frame = self.cam.grab()
+            if frame is None:
+                if time.time() > deadline:
+                    return None
+            elif (frame.shape[1] >= self.cam.width * 0.95
+                    and frame.shape[0] >= self.cam.height * 0.95):
+                return frame
+            elif time.time() > deadline:
+                return frame
+            QApplication.processEvents()
+            time.sleep(0.03)
+
+    def page(self):
+        return self.pages[self.current] if 0 <= self.current < len(self.pages) else None
+
+    def _add_thumb(self, page):
+        item = QListWidgetItem(page.name)
+        item.setSizeHint(QSize(THUMB.width() + 30, THUMB.height() + 28))
+        self.tray.addItem(item)
+        self._refresh_thumb(len(self.pages) - 1)
+        self._count()
+
+    def _refresh_thumb(self, i):
+        if not (0 <= i < len(self.pages)) or i >= self.tray.count():
+            return
+        page = self.pages[i]
+        try:
+            img = imaging.process(page.frame, page.adjust, page.corners, max_dim=260)
+        except Exception:
+            img = imaging.fit(page.frame, 260)
+        qimg = to_qimage(img)
+        if qimg is not None:
+            self.tray.item(i).setIcon(QIcon(QPixmap.fromImage(qimg)))
+
+    def _count(self):
+        n = len(self.pages)
+        self.lbl_pages.setText("Pages · %d" % n if n else "Pages")
+
+    def _tray_changed(self, row):
+        if row < 0 or row == self.current:
+            return
+        self.current = row
+        self._sync_controls()
+        self.set_mode("edit")
+
+    def step_page(self, delta):
+        if not self.pages:
+            return
+        self.tray.setCurrentRow(max(0, min(len(self.pages) - 1, self.current + delta)))
 
     def delete_page(self):
-        if self.cur() is None:
+        page = self.page()
+        if page is None:
             return
-        del self.pages[self.current]
-        self.current = min(self.current, len(self.pages) - 1)
-        self._edit_cache = None
-        if not self.pages:
+        i = self.current
+        self.pages.pop(i)
+        self.tray.blockSignals(True)
+        self.tray.takeItem(i)
+        for j in range(i, len(self.pages)):
+            self.pages[j].name = "Page %d" % (j + 1)
+            self.tray.item(j).setText(self.pages[j].name)
+        self.tray.blockSignals(False)
+        self.current = min(i, len(self.pages) - 1)
+        self._count()
+        if self.pages:
+            self.tray.setCurrentRow(self.current)
+            self._sync_controls()
+            self._render_page()
+        else:
             self.set_mode("live")
-        self.refresh_tray()
-        self.render_edit()
 
-    def select_page(self, i):
-        self.current = i
-        self._edit_cache = None
-        self.corner_mode = False
-        self.set_mode("edit")
-        self._sync_sliders()
-        self.refresh_tray()
+    def clear_pages(self):
+        if not self.pages:
+            return
+        if QMessageBox.question(self, "Clear all",
+                                "Discard all %d pages?" % len(self.pages)
+                                ) != QMessageBox.Yes:
+            return
+        self.pages = []
+        self.current = -1
+        self.tray.blockSignals(True)
+        self.tray.clear()
+        self.tray.blockSignals(False)
+        self._count()
+        self.set_mode("live")
 
-    def refresh_tray(self):
-        for w in self.tray_inner.winfo_children():
-            w.destroy()
-        self.lbl_pages.configure(text="Pages %d" % len(self.pages))
-        for i, page in enumerate(self.pages):
-            if page.thumb is None:
-                small = imaging.fit(page.frame, 420)
-                out = imaging.process(small, page.adjust, page.corners, THUMB_W)
-                rgb = cv2.cvtColor(imaging.fit(out, THUMB_W), cv2.COLOR_BGR2RGB)
-                page.thumb = ImageTk.PhotoImage(Image.fromarray(rgb))
-            border = ACCENT if i == self.current else PANEL
-            holder = tk.Frame(self.tray_inner, bg=border, padx=2, pady=2)
-            holder.pack(fill="x", padx=6, pady=4)
-            lbl = tk.Label(holder, image=page.thumb, bd=0, bg=PANEL)
-            lbl.pack()
-            lbl.bind("<Button-1>", lambda e, k=i: self.select_page(k))
-            tk.Label(holder, text="%d" % (i + 1), bg=border, fg=FG,
-                     font=("Helvetica", 9)).pack()
+    def import_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import images", os.path.expanduser("~"),
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp)")
+        added = 0
+        for path in paths:
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            page = Page(img, detect.detect(imaging.fit(img, 900)),
+                        imaging.new_adjust(), "Page %d" % (len(self.pages) + 1))
+            self.pages.append(page)
+            self._add_thumb(page)
+            added += 1
+        if added:
+            self.current = len(self.pages) - 1
+            self.tray.setCurrentRow(self.current)
+            self._sync_controls()
+            self.set_mode("edit")
+            self.toast.show_message("Imported %d image%s" % (added, "" if added == 1 else "s"),
+                                    "good")
 
-    # ── editing ──────────────────────────────────────────────────
+    # ══ modes ════════════════════════════════════════════════════
 
     def set_mode(self, mode):
-        if mode == "edit" and self.cur() is None:
+        if mode == "edit" and self.page() is None:
             mode = "live"
         self.mode = mode
-        self.btn_live.configure(bg=ACCENT if mode == "live" else LINE,
-                                fg="#04101f" if mode == "live" else FG)
-        self.btn_edit.configure(bg=ACCENT if mode == "edit" else LINE,
-                                fg="#04101f" if mode == "edit" else FG)
-        if mode == "edit":
-            self._sync_sliders()
-            self.render_edit()
-
-    def _sync_sliders(self):
-        page = self.cur()
-        a = page.adjust if page else imaging.new_adjust()
-        for key, var in self.var.items():
-            if key in a and isinstance(var, tk.DoubleVar):
-                var.set(float(a[key]))
-        for key, btn in self.filter_buttons.items():
-            on = a.get("filter") == key
-            btn.configure(bg=ACCENT if on else LINE, fg="#04101f" if on else FG2)
-
-    def _apply_adjust(self, key, value):
-        page = self.cur()
-        if page is None:
-            return
-        if page.adjust.get(key) == value:
-            return
-        page.adjust[key] = value
-        if key not in imaging.GEOMETRY_KEYS:
-            page.adjust["filter"] = "custom"
-            for k, b in self.filter_buttons.items():
-                b.configure(bg=LINE, fg=FG2)
-        page.thumb = None
-        self.render_edit(fast=True)
-
-    def set_filter(self, name):
-        page = self.cur()
-        if page is None:
-            return
-        imaging.set_filter(page.adjust, name)
-        page.thumb = None
-        self._sync_sliders()
-        self.render_edit()
-        self.refresh_tray()
-
-    def rotate(self, delta):
-        page = self.cur()
-        if page is None:
-            return
-        page.adjust["rotate"] = (int(page.adjust["rotate"]) + delta) % 360
-        page.thumb = None
-        self.render_edit()
-
-    def flip(self, key):
-        page = self.cur()
-        if page is None:
-            return
-        page.adjust[key] = not page.adjust.get(key)
-        page.thumb = None
-        self.render_edit()
-
-    def apply_all(self):
-        page = self.cur()
-        if page is None:
-            return
-        n = 0
-        for other in self.pages:
-            if other is page:
-                continue
-            keep = {k: other.adjust[k] for k in ("rotate", "fliph", "flipv", "straighten")}
-            other.adjust = dict(page.adjust)
-            other.adjust.update(keep)
-            other.thumb = None
-            n += 1
-        self.refresh_tray()
-        self.lbl_export.configure(text="applied to %d other page%s" % (n, "" if n == 1 else "s"))
+        self.btn_live.setChecked(mode == "live")
+        self.btn_edit.setChecked(mode == "edit")
+        self.btn_capture.setEnabled(mode == "live" and self.cam.is_open())
+        if mode == "live":
+            self.btn_corners.setChecked(False)
+            self.preview.set_editable(False)
+            self.preview.set_placeholder("Camera stopped.\nPress Start."
+                                         if not self.cam.is_open() else "Starting…")
+            if not self.cam.is_open():
+                self.preview.clear()
+            self._last_seq = -1
+        else:
+            self._render_page()
 
     def toggle_corners(self):
-        if self.cur() is None:
+        if self.mode != "edit" or self.page() is None:
+            self.toast.show_message("Capture a page first", "warn")
+            self.btn_corners.setChecked(False)
             return
-        self.corner_mode = not self.corner_mode
-        self.set_mode("edit")
-        self.render_edit()
+        on = not self.preview.is_editable()
+        self.btn_corners.setChecked(on)
+        page = self.page()
+        if on and page.corners is None:
+            page.corners = detect.full_frame().copy()
+        self.preview.set_editable(on)
+        self._render_page()
+
+    def _corners_dragged(self, quad):
+        page = self.page()
+        if page is None:
+            return
+        page.corners = np.asarray(quad, dtype=np.float32)
+        self._render_page()
 
     def redetect(self):
-        page = self.cur()
+        page = self.page()
         if page is None:
+            self.toast.show_message("Capture a page first", "warn")
             return
-        q = detect.detect(page.frame)
-        page.corners = q
-        page.thumb = None
-        self.lbl_hint.configure(text="page edges detected" if q is not None
-                                else "no page found — using the whole frame")
-        self.render_edit()
-        self.refresh_tray()
+        quad = detect.detect(imaging.fit(page.frame, 900))
+        page.corners = quad
+        self._render_page()
+        self.toast.show_message("Page found" if quad is not None else
+                                "No page found — use Corners",
+                                "good" if quad is not None else "warn")
 
-    def render_edit(self, fast=False):
-        page = self.cur()
-        if page is None:
-            self.canvas.delete("all")
-            self.lbl_info.configure(text="")
+    # ══ rendering the editor ═════════════════════════════════════
+
+    def _render_page(self):
+        page = self.page()
+        if page is None or self.mode != "edit":
             return
-        cw = max(1, self.canvas.winfo_width())
-        ch = max(1, self.canvas.winfo_height())
-
-        if self.corner_mode:
-            small = self._fit_to_canvas(page.frame, cw, ch)
-            self._show(small)
-            quad = page.corners if page.corners is not None else detect.full_frame()
-            self._draw_quad(quad, handles=True)
-            self.lbl_hint.configure(text="drag the corners — Corners again when done")
+        editing = self.preview.is_editable()
+        if editing:
+            # While the corners are being dragged, show the uncropped frame —
+            # you cannot place a corner on a picture the corners already cut.
+            view = imaging.fit(page.frame, max(700, self.preview.width() * 2))
+            self.preview.set_image(to_qimage(view))
+            self.preview.set_quad(page.corners if page.corners is not None
+                                  else detect.full_frame())
         else:
-            cap = int(max(cw, ch) * (0.8 if fast else 1.4))
-            cap = max(700, min(cap, 2600))
-            src = imaging.fit(page.frame, cap)
-            # corners are normalised, so they survive the downscale unchanged
-            out = imaging.process(src, page.adjust, page.corners, cap)
-            small = self._fit_to_canvas(out, cw, ch)
-            self._show(small)
-            self.lbl_hint.configure(text="")
+            limit = max(700, min(EDIT_MAX, self.preview.width() * 2))
+            try:
+                img = imaging.process(page.frame, page.adjust, page.corners,
+                                      max_dim=limit)
+            except Exception as exc:                # noqa: BLE001
+                self.toast.show_message("Preview failed: %s" % exc, "bad")
+                return
+            self.preview.set_image(to_qimage(img))
+            self.preview.set_quad(None)
+        self._page_info(page)
+        self._refresh_thumb(self.current)
 
-        h, w = page.frame.shape[:2]
-        fw, fh = imaging.target_size(page.adjust, page.corners, w, h)
-        self.lbl_info.configure(
-            text="page %d/%d   source %d×%d   output %d×%d%s"
-                 % (self.current + 1, len(self.pages), w, h, fw, fh,
-                    "   cropped" if page.corners is not None else ""))
+    def _page_info(self, page):
+        fh, fw = page.frame.shape[:2]
+        ow, oh = imaging.target_size(page.adjust, page.corners, fw, fh)
+        dpi = max(ow, oh) / A4_INCHES
+        self.lbl_info.setText("%s  ·  source %d×%d  ·  output %d×%d  ·  ≈%d dpi"
+                              % (page.name, fw, fh, ow, oh, round(dpi)))
+        self.lbl_hint.setText("drag the corners" if self.preview.is_editable() else "")
+        self.lbl_hint.setStyleSheet("color: %s;" % ACCENT)
 
-    # ── corner dragging ──────────────────────────────────────────
+    def _queue_render(self):
+        self.repro.start(110)
 
-    def _canvas_to_norm(self, ex, ey):
-        if self._view is None:
-            return None
-        x, y, w, h = self._view
-        return (float(np.clip((ex - x) / float(w), 0, 1)),
-                float(np.clip((ey - y) / float(h), 0, 1)))
+    # ══ adjustments ══════════════════════════════════════════════
 
-    def _on_press(self, ev):
-        if self.mode != "edit" or not self.corner_mode or self.cur() is None:
+    def _sync_controls(self):
+        """Push the current page's settings into the panel without echoing back."""
+        page = self.page()
+        a = page.adjust if page else imaging.new_adjust()
+        preset = imaging.FILTERS.get(a.get("filter"), {})
+        for key, row in self.sliders.items():
+            row.set_value(a.get(key, imaging.DEFAULTS[key]),
+                          default=preset.get(key, imaging.DEFAULTS[key]))
+        for key, b in self.filter_buttons.items():
+            b.setChecked(key == a.get("filter") and not a.get("custom"))
+        self.outsize.blockSignals(True)
+        keys = [k for k, _ in OUTSIZES]
+        self.outsize.setCurrentIndex(keys.index(a.get("outsize", "detected"))
+                                     if a.get("outsize") in keys else 0)
+        self.outsize.blockSignals(False)
+        self.txt_ocr.setPlainText((page.ocr or {}).get("text", "") if page else "")
+
+    def _slider_changed(self, key, value):
+        page = self.page()
+        if page is None:
             return
-        page = self.cur()
-        if page.corners is None:
-            page.corners = detect.full_frame()
-        p = self._canvas_to_norm(ev.x, ev.y)
-        if p is None:
-            return
-        x, y, w, h = self._view
-        best, bestd = -1, 22.0
-        for i, c in enumerate(page.corners):
-            d = np.hypot((c[0] - p[0]) * w, (c[1] - p[1]) * h)
-            if d < bestd:
-                best, bestd = i, d
-        self._drag_corner = best
-        if best >= 0:
-            self.render_edit()
+        page.adjust[key] = value
+        page.adjust["custom"] = True
+        for k, b in self.filter_buttons.items():
+            b.setChecked(False)
+        self._queue_render()
 
-    def _on_drag(self, ev):
-        if self._drag_corner < 0:
+    def set_filter(self, name):
+        page = self.page()
+        if page is None:
+            self.toast.show_message("Capture a page first", "warn")
+            self._sync_controls()
             return
-        page = self.cur()
-        p = self._canvas_to_norm(ev.x, ev.y)
-        if p is None:
+        imaging.set_filter(page.adjust, name)
+        page.adjust["custom"] = False
+        self._sync_controls()
+        self._render_page()
+
+    def _outsize_changed(self, i):
+        page = self.page()
+        if page is None:
             return
-        page.corners[self._drag_corner] = p
-        self.render_edit()
+        page.adjust["outsize"] = OUTSIZES[i][0]
+        self._queue_render()
 
-    def _on_release(self, _ev):
-        if self._drag_corner < 0:
+    def rotate(self, deg):
+        page = self.page()
+        if page is None:
             return
-        self._drag_corner = -1
-        page = self.cur()
-        if page is not None and page.corners is not None:
-            page.corners = detect._order(page.corners) / 1.0
-            page.thumb = None
-        self.render_edit()
-        self.refresh_tray()
+        page.adjust["rotate"] = (page.adjust.get("rotate", 0) + deg) % 360
+        self._render_page()
 
-    # ── export ───────────────────────────────────────────────────
+    def flip(self, key):
+        page = self.page()
+        if page is None:
+            return
+        page.adjust[key] = not page.adjust.get(key, False)
+        self._render_page()
 
-    def _render_full(self, page):
-        """Full resolution, from the pristine frame. Never downscaled."""
-        return imaging.process(page.frame, page.adjust, page.corners, None)
+    def apply_all(self):
+        page = self.page()
+        if page is None or len(self.pages) < 2:
+            return
+        keep = ("filter", "custom", "mode", "flatten", "wb", "temp", "tint",
+                "exposure", "contrast", "gamma", "highlights", "shadows",
+                "saturation", "vibrance", "denoise", "sharpen", "threshold",
+                "window", "outsize")
+        for i, other in enumerate(self.pages):
+            if other is page:
+                continue
+            for k in keep:
+                if k in page.adjust:
+                    other.adjust[k] = page.adjust[k]
+            self._refresh_thumb(i)
+        self.toast.show_message("Applied to %d pages" % len(self.pages), "good")
+
+    # ══ export ═══════════════════════════════════════════════════
+
+    def _full(self, page):
+        return imaging.process(page.frame, page.adjust, page.corners)
 
     def export_image(self):
-        page = self.cur()
+        page = self.page()
         if page is None:
-            messagebox.showinfo("Export", "No page selected.")
+            self.toast.show_message("Nothing to save", "warn")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".jpg", initialfile="scan-%s.jpg" % time.strftime("%Y%m%d-%H%M%S"),
-            filetypes=[("JPEG (quality 98)", "*.jpg"), ("PNG (lossless)", "*.png"),
-                       ("TIFF (lossless)", "*.tif")])
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save image", os.path.join(os.path.expanduser("~/Desktop"),
+                                             page.name.replace(" ", "-").lower() + ".jpg"),
+            "JPEG (*.jpg);;PNG (*.png);;TIFF (*.tif)")
         if not path:
             return
-        self._set_busy(True)
-        try:
-            out = self._render_full(page)
-            ext = os.path.splitext(path)[1].lower()
-            if ext in (".jpg", ".jpeg"):
-                params = [int(cv2.IMWRITE_JPEG_QUALITY), 98]
-            elif ext == ".png":
-                params = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
-            else:
-                params = []
-            ok, buf = cv2.imencode(ext if ext else ".jpg", out, params)
-            if not ok:
-                raise RuntimeError("could not encode %s" % ext)
-            buf.tofile(path)
-            self.lbl_export.configure(
-                text="saved %d×%d  %.1f MB" % (out.shape[1], out.shape[0],
-                                                    os.path.getsize(path) / 1048576.0))
-        except Exception as exc:
-            messagebox.showerror("Export", str(exc))
-        finally:
-            self._set_busy(False)
+        self._start_job("Saving…", self._write_image, page, path)
+
+    def _write_image(self, page, path):
+        img = self._full(page)
+        ext = os.path.splitext(path)[1].lower()
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), 98] if ext in (".jpg", ".jpeg") else []
+        if not cv2.imwrite(path, img, params):
+            raise RuntimeError("could not write %s" % path)
+        return "%s  ·  %d×%d  ·  %.1f MB" % (os.path.basename(path), img.shape[1],
+                                             img.shape[0],
+                                             os.path.getsize(path) / 1e6)
 
     def export_pdf(self):
         if not self.pages:
-            messagebox.showinfo("Export", "No pages to export.")
+            self.toast.show_message("Nothing to save", "warn")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".pdf", initialfile="scan-%s.pdf" % time.strftime("%Y%m%d-%H%M%S"),
-            filetypes=[("PDF", "*.pdf")])
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save PDF", os.path.join(os.path.expanduser("~/Desktop"), "scan.pdf"),
+            "PDF (*.pdf)")
         if not path:
             return
-        self._set_busy(True)
-        try:
-            entries = []
-            for i, page in enumerate(self.pages):
-                self.lbl_export.configure(text="rendering %d/%d…" % (i + 1, len(self.pages)))
-                self.root.update_idletasks()
-                out = self._render_full(page)
-                ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
-                if not ok:
-                    continue
-                entry = {"jpeg": buf.tobytes(),
-                         "width": out.shape[1], "height": out.shape[0]}
-                if page.ocr and page.ocr.get("words"):
-                    # OCR ran on a render of the same page, so a single scale
-                    # factor maps its boxes onto this one.
-                    k = out.shape[1] / float(max(1, page.ocr.get("img_w", out.shape[1])))
-                    entry["words"] = [
-                        {"text": w["text"], "x0": w["x0"] * k, "y0": w["y0"] * k,
-                         "x1": w["x1"] * k, "y1": w["y1"] * k}
-                        for w in page.ocr["words"]]
-                entries.append(entry)
-            data = pdfwriter.build(entries, page_size="a4",
-                                   title="Scan %s" % time.strftime("%Y-%m-%d"))
-            with open(path, "wb") as fh:
-                fh.write(data)
-            self.lbl_export.configure(text="saved %d page%s  %.1f MB"
-                                           % (len(entries), "" if len(entries) == 1 else "s",
-                                              len(data) / 1048576.0))
-        except Exception as exc:
-            messagebox.showerror("Export", str(exc))
-        finally:
-            self._set_busy(False)
+        self._start_job("Building PDF…", self._write_pdf, list(self.pages), path)
 
-    # ── OCR ──────────────────────────────────────────────────────
+    def _write_pdf(self, pages, path):
+        out = []
+        for page in pages:
+            img = self._full(page)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            if not ok:
+                raise RuntimeError("could not encode %s" % page.name)
+            words = []
+            if page.ocr:
+                k = img.shape[1] / float(page.ocr.get("img_w") or img.shape[1])
+                words = [{"text": w["text"], "x0": w["x0"] * k, "y0": w["y0"] * k,
+                          "x1": w["x1"] * k, "y1": w["y1"] * k}
+                         for w in page.ocr.get("words", [])]
+            out.append({"jpeg": buf.tobytes(), "width": img.shape[1],
+                        "height": img.shape[0], "words": words})
+        data = pdfwriter.build(out, page_size="a4", title="Scan",
+                               searchable=any(p["words"] for p in out))
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return "%s  ·  %d page%s  ·  %.1f MB" % (
+            os.path.basename(path), len(out), "" if len(out) == 1 else "s",
+            len(data) / 1e6)
 
-    def run_ocr(self, page=None, quiet=False):
-        page = page or self.cur()
+    def export_text(self):
+        texts = [(p.name, (p.ocr or {}).get("text", "")) for p in self.pages]
+        if not any(t for _n, t in texts):
+            self.toast.show_message("No OCR text yet — press Read all", "warn")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save text", os.path.join(os.path.expanduser("~/Desktop"), "scan.txt"),
+            "Text (*.txt)")
+        if not path:
+            return
+        with open(path, "w") as fh:
+            for name, text in texts:
+                fh.write("── %s ──\n%s\n\n" % (name, text))
+        self.toast.show_message("Saved %s" % os.path.basename(path), "good")
+
+    # ══ OCR ══════════════════════════════════════════════════════
+
+    def run_ocr(self):
+        page = self.page()
         if page is None:
-            messagebox.showinfo("OCR", "No page selected.")
-            return False
+            self.toast.show_message("Capture a page first", "warn")
+            return
         if not ocr.available():
-            messagebox.showinfo("OCR", ocr.install_hint())
-            return False
-        self._set_busy(True)
-        self.lbl_ocr.configure(text="reading…", fg=FG3)
-        self.root.update_idletasks()
-        try:
-            # Read the processed page, not the raw frame: the filters are what
-            # make the text legible in the first place.
-            img = self._render_full(page)
-            res = ocr.recognise(img)
-            page.ocr = res
-            conf = res["confidence"]
-            self.lbl_ocr.configure(
-                text="%d words%s" % (len(res["words"]),
-                                     "" if conf is None else "   %d%% confidence" % round(conf)),
-                fg=GOOD)
-            if not quiet:
-                self.txt_ocr.delete("1.0", "end")
-                self.txt_ocr.insert("1.0", res["text"])
-            return True
-        except Exception as exc:
-            self.lbl_ocr.configure(text=str(exc)[:160], fg=BAD)
-            if not quiet:
-                messagebox.showerror("OCR", str(exc))
-            return False
-        finally:
-            self._set_busy(False)
+            self.toast.show_message("Tesseract is not installed", "bad")
+            return
+        self.lbl_ocr.setText("reading…")
+        self._start_job("Reading…", self._read, [page], quiet=True)
 
     def run_ocr_all(self):
         if not self.pages:
             return
-        for i, page in enumerate(self.pages):
-            self.lbl_ocr.configure(text="reading page %d/%d…" % (i + 1, len(self.pages)))
-            self.root.update_idletasks()
-            if not self.run_ocr(page, quiet=True):
-                return
-        done = sum(1 for p in self.pages if p.ocr)
-        self.lbl_ocr.configure(text="read %d page%s" % (done, "" if done == 1 else "s"), fg=GOOD)
-
-    def export_text(self):
-        texts = [(p.ocr or {}).get("text", "") for p in self.pages]
-        if not any(t.strip() for t in texts):
-            messagebox.showinfo("Text", "No recognised text yet — run Read all first.")
+        if not ocr.available():
+            self.toast.show_message("Tesseract is not installed", "bad")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt", initialfile="scan-%s.txt" % time.strftime("%Y%m%d-%H%M%S"),
-            filetypes=[("Text", "*.txt")])
-        if not path:
+        self.lbl_ocr.setText("reading %d pages…" % len(self.pages))
+        self._start_job("Reading…", self._read, list(self.pages), quiet=True)
+
+    def _read(self, pages):
+        confs = []
+        for page in pages:
+            img = imaging.process(page.frame, page.adjust, page.corners, max_dim=2600)
+            page.ocr = ocr.recognise(img)
+            if page.ocr.get("confidence") is not None:
+                confs.append(page.ocr["confidence"])
+        return confs
+
+    # ══ job plumbing ═════════════════════════════════════════════
+
+    def _job(self, fn, *args):
+        """Run `fn` on a worker thread; returns a `connect`-style callable."""
+        job = Job()
+        self._jobs.append(job)
+
+        def connect(handler):
+            def deliver(result, err):
+                self._jobs.remove(job)
+                handler(result, err)
+            job.done.connect(deliver)
+            job.run(fn, *args)
+        return connect
+
+    def _start_job(self, message, fn, *args, **kw):
+        quiet = kw.pop("quiet", False)
+        if self.busy:
+            self.toast.show_message("Still working on the last one…", "warn")
             return
-        with open(path, "w", encoding="utf-8") as fh:
-            for i, t in enumerate(texts):
-                fh.write("--- page %d ---\n%s\n\n" % (i + 1, t))
-        self.lbl_export.configure(text="saved text for %d page(s)" % len(texts))
+        self.busy = True
+        self.lbl_state.setText(message)
+        self.setCursor(Qt.BusyCursor)
+        self._job(fn, *args)(lambda r, e: self._job_done(r, e, quiet))
 
-    def _set_busy(self, busy):
-        self._busy = busy
-        self.root.configure(cursor="watch" if busy else "")
-        self.root.update_idletasks()
+    def _job_done(self, result, err, quiet):
+        self.busy = False
+        self.unsetCursor()
+        self.lbl_state.setText(self.cam.name if self.cam.is_open() else "stopped")
+        if err is not None:
+            self.toast.show_message(str(err), "bad")
+            self.lbl_ocr.setText(str(err))
+            return
+        if quiet:
+            page = self.page()
+            text = (page.ocr or {}).get("text", "") if page else ""
+            self.txt_ocr.setPlainText(text)
+            confs = result or []
+            self.lbl_ocr.setText(
+                "%d page%s read · mean confidence %d%%"
+                % (len(confs), "" if len(confs) == 1 else "s",
+                   round(sum(confs) / len(confs))) if confs else "no text found")
+            self.lbl_ocr.setStyleSheet("color: %s;" % (GOOD if confs else WARN))
+            return
+        self.toast.show_message("Saved %s" % result, "good")
 
-    def _on_close(self):
+    # ══ window ═══════════════════════════════════════════════════
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.toast.reposition()
+        if self.mode == "edit":
+            self._queue_render()
+
+    def closeEvent(self, e):
+        self.timer.stop()
         self.cam.close()
-        self.root.destroy()
+        super().closeEvent(e)
 
 
 def main():
-    root = tk.Tk()
-    App(root)
-    # Tk opens behind whatever is in front on macOS; ask for focus once.
-    root.lift()
-    root.attributes("-topmost", True)
-    root.after(400, lambda: root.attributes("-topmost", False))
-    try:
-        root.createcommand("::tk::mac::ReopenApplication", root.lift)
-    except tk.TclError:
-        pass
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("Overhead Scanner")
+    app.setStyleSheet(QSS)
+    win = App()
+    win.show()
+    win.raise_()
+    win.activateWindow()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
