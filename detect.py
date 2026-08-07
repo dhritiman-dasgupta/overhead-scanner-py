@@ -174,7 +174,7 @@ def output_size(corners, width, height):
     return max(16, int(round(w))), max(16, int(round(h)))
 
 
-def warp(frame, corners, size=None):
+def warp(frame, corners, size=None, interp=cv2.INTER_LANCZOS4):
     """Straighten the quad out of the frame into a rectangle."""
     H, W = frame.shape[:2]
     src = (np.asarray(corners, dtype=np.float32) *
@@ -184,7 +184,7 @@ def warp(frame, corners, size=None):
     M = cv2.getPerspectiveTransform(src, dst)
     # INTER_AREA is not valid for warpPerspective; LANCZOS4 keeps small print
     # crisp when the crop is being scaled down.
-    return cv2.warpPerspective(frame, M, (ow, oh), flags=cv2.INTER_LANCZOS4,
+    return cv2.warpPerspective(frame, M, (ow, oh), flags=interp,
                                borderMode=cv2.BORDER_REPLICATE)
 
 

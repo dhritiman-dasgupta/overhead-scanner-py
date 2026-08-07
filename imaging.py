@@ -75,18 +75,23 @@ def set_filter(adjust, name):
 
 # ── helpers ──────────────────────────────────────────────────────
 
-def _shoulder(x):
+def _shoulder(x, inplace=False):
     """Compress above the knee instead of clipping, so bright detail survives."""
-    out = x.copy()
-    hi = x > KNEE
-    if np.any(hi):
-        out[hi] = KNEE + (255.0 - KNEE) * np.tanh((x[hi] - KNEE) / (255.0 - KNEE))
-    return np.clip(out, 0, 255)
+    out = x if inplace else np.array(x, dtype=np.float32, copy=True)
+    hi = out > KNEE
+    if hi.any():
+        # tanh only where it matters. Evaluating it over every pixel of a 16 MP
+        # frame costs more than the boolean index that avoids it.
+        v = out[hi]
+        out[hi] = KNEE + (255.0 - KNEE) * np.tanh((v - KNEE) / (255.0 - KNEE))
+    return np.clip(out, 0, 255, out=out)
 
 
 def _paper_level(img, pct=90):
-    g = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-    return float(np.percentile(g[::4, ::4], pct))
+    # Subsample *before* converting. A percentile does not need every pixel,
+    # and converting the whole frame first was most of the cost.
+    s = np.clip(img[::4, ::4], 0, 255).astype(np.uint8)
+    return float(np.percentile(cv2.cvtColor(s, cv2.COLOR_BGR2GRAY), pct))
 
 
 # ── stages ───────────────────────────────────────────────────────
@@ -105,7 +110,10 @@ def _flatten(img, strength):
     to white.
     """
     h, w = img.shape[:2]
-    gray = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    src = np.asarray(img, dtype=np.float32)
+    # cvtColor takes float32 directly. Clipping to uint8 first allocated a
+    # second full-size float array purely to throw it away.
+    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
 
     bw = int(np.clip(round(w / 14.0), 10, 88))
     bh = int(np.clip(round(h / 14.0), 10, 88))
@@ -114,7 +122,9 @@ def _flatten(img, strength):
     # per-block maximum: dilate by a block, then sample. Text and ink are dark,
     # and the maximum reads straight through them to the paper underneath.
     peak = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky)))
+    del gray
     small = cv2.resize(peak, (bw, bh), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+    del peak
 
     broad_k = max(3, (int(min(bw, bh) / 3) * 2 + 1))
     broad = cv2.GaussianBlur(small, (broad_k, broad_k), 0)
@@ -128,8 +138,12 @@ def _flatten(img, strength):
     gain = np.clip(np.power(255.0 / bg, s), 0.2, 3.5)
     gain = cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    out = img.astype(np.float32) * gain[:, :, None]
-    return _shoulder(out)
+    # In place, and the gain map freed before the shoulder runs. At 16 MP each
+    # of these arrays is 200 MB; the version that let every stage allocate its
+    # own output peaked at 2 GB for one page.
+    src *= gain[:, :, None]
+    del gain
+    return _shoulder(src, inplace=True)
 
 
 def _white_balance(img, mode):
@@ -141,21 +155,27 @@ def _white_balance(img, mode):
     """
     if mode == "off":
         return img
-    f = img.astype(np.float32)
+    f = np.asarray(img, dtype=np.float32)
+    # Statistics only, so every third pixel in each direction is plenty: a
+    # mean and a percentile do not change, and masking the full frame was
+    # costing more than the rest of the stage put together.
+    sample = f[::3, ::3]
     if mode == "gray":
-        cut = max(24.0, _paper_level(img) * 0.55)
-        g = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        cut = max(24.0, _paper_level(sample) * 0.55)
+        g = (sample[:, :, 0] * 0.114 + sample[:, :, 1] * 0.587
+             + sample[:, :, 2] * 0.299)
         m = g >= cut
-        if m.sum() < 32:
-            return img
-        means = f[m].reshape(-1, 3).mean(axis=0)
+        if int(m.sum()) < 32:
+            return f
+        means = sample[m].mean(axis=0)
     elif mode == "white":
-        means = np.percentile(f.reshape(-1, 3), 97, axis=0) / 248.0 * 255.0
+        means = np.percentile(sample.reshape(-1, 3), 97, axis=0) / 248.0 * 255.0
     else:
-        return img
+        return f
     means = np.maximum(means, 1.0)
     gains = np.clip(means.mean() / means, 0.55, 1.9)
-    return f * gains[None, None, :]
+    f *= gains[None, None, :]
+    return f
 
 
 def _tone_lut(a):
@@ -175,14 +195,23 @@ def _tone_lut(a):
 
 
 def _saturation(img, sat, vib):
-    f = img.astype(np.float32)
-    lum = (f[:, :, 2] * 0.2126 + f[:, :, 1] * 0.7152 + f[:, :, 0] * 0.0722)[:, :, None]
+    f = np.asarray(img, dtype=np.float32)
+    # cv2.transform does the luminance dot product in one pass and one buffer;
+    # the arithmetic spelling allocated three.
+    lum = cv2.transform(f, np.array([[0.0722, 0.7152, 0.2126]], np.float32))[:, :, None]
     amt = 1.0 + sat / 100.0
     if vib:
         mx = f.max(axis=2, keepdims=True)
         mn = f.min(axis=2, keepdims=True)
-        amt = amt + (vib / 100.0) * (1.0 - (mx - mn) / 255.0)
-    return lum + (f - lum) * amt
+        mx -= mn
+        mx *= -(vib / 100.0) / 255.0
+        mx += 1.0 + (vib / 100.0)
+        amt = mx * amt if sat else mx
+        del mn
+    f -= lum
+    f *= amt
+    f += lum
+    return f
 
 
 def _sharpen(img, amount):
@@ -190,9 +219,13 @@ def _sharpen(img, amount):
     h, w = img.shape[:2]
     r = int(np.clip(round(max(w, h) / 1500.0), 1, 6))
     k = 2 * r + 1
-    src = img.astype(np.float32)
+    src = np.asarray(img, dtype=np.float32)
     blur = cv2.GaussianBlur(src, (k, k), 0)
-    return _shoulder(src + (src - blur) * (amount / 100.0))
+    blur -= src                       # blur now holds -(src - blur)
+    blur *= -(amount / 100.0)
+    src += blur
+    del blur
+    return _shoulder(src, inplace=True)
 
 
 def _adaptive_threshold(img, bias, window_pct):
@@ -255,22 +288,31 @@ def target_size(a, corners, w, h, max_dim=None):
 
 # ── the pipeline ─────────────────────────────────────────────────
 
-def process(frame, a, corners=None, max_dim=None):
-    """Full path from a captured frame to a finished page (BGR uint8)."""
+def process(frame, a, corners=None, max_dim=None, fast=False):
+    """Full path from a captured frame to a finished page (BGR uint8).
+
+    `fast` trades the resampler for speed — measured at 30 ms against 3 ms for
+    one 16 MP warp, which is the difference between a slider that drags and a
+    slider that stutters. It is only ever used for what is on screen; an export
+    always takes the slow, sharp path.
+    """
     import detect as _d
     h, w = frame.shape[:2]
     size = target_size(a, corners, w, h, max_dim)
 
     if corners is not None:
-        img = _d.warp(frame, corners, size)
+        img = _d.warp(frame, corners, size,
+                      interp=cv2.INTER_LINEAR if fast else cv2.INTER_LANCZOS4)
     elif (size[0], size[1]) != (w, h):
-        interp = cv2.INTER_AREA if size[0] < w else cv2.INTER_LANCZOS4
+        interp = (cv2.INTER_AREA if size[0] < w
+                  else (cv2.INTER_LINEAR if fast else cv2.INTER_LANCZOS4))
         img = cv2.resize(frame, size, interpolation=interp)
     else:
         img = frame
 
     img = transform(img, a)
     f = img.astype(np.float32)
+    del img                 # the uint8 copy is 50 MB at 16 MP and is done with
 
     if a["flatten"] > 0:
         f = _flatten(f, a["flatten"])
@@ -281,34 +323,44 @@ def process(frame, a, corners=None, max_dim=None):
         t, ti = a["temp"] / 300.0, a["tint"] / 300.0
         gains = np.array([(1 - t) * (1 - ti * 0.5), 1 + ti, (1 + t) * (1 - ti * 0.5)],
                          dtype=np.float32)   # BGR
-        f = f * gains[None, None, :]
+        f *= gains[None, None, :]
 
     if (a["contrast"] or a["exposure"] or a["highlights"] or a["shadows"]
             or abs(a["gamma"] - 1.0) > 1e-6):
-        f = cv2.LUT(np.clip(f, 0, 255).astype(np.uint8), _tone_lut(a)).astype(np.float32)
+        np.clip(f, 0, 255, out=f)
+        u8 = f.astype(np.uint8)
+        cv2.LUT(u8, _tone_lut(a), dst=u8)
+        f[...] = u8                          # back into the buffer we already have
+        del u8
 
     if a["mode"] == "color" and (a["saturation"] or a["vibrance"]):
         f = _saturation(f, a["saturation"], a["vibrance"])
 
     if a["denoise"] > 0:
         k = 3 if max(f.shape[:2]) < 2000 else 5
-        med = cv2.medianBlur(np.clip(f, 0, 255).astype(np.uint8), k).astype(np.float32)
+        np.clip(f, 0, 255, out=f)
+        med = cv2.medianBlur(f.astype(np.uint8), k)
         t = a["denoise"] / 100.0
-        f = f * (1 - t) + med * t
+        f *= (1.0 - t)
+        f += np.multiply(med, np.float32(t))   # float32, not float64 by promotion
+        del med
 
     if a["sharpen"] > 0:
         f = _sharpen(f, a["sharpen"])
 
     if a["mode"] == "gray":
-        g = cv2.cvtColor(np.clip(f, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        f = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR).astype(np.float32)
+        np.clip(f, 0, 255, out=f)
+        g = cv2.cvtColor(f.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        f[...] = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+        del g
     elif a["mode"] == "bw":
         f = _adaptive_threshold(f, a["threshold"], a["window"])
 
     if a.get("invert"):
-        f = 255.0 - f
+        np.subtract(255.0, f, out=f)
 
-    return np.clip(f, 0, 255).astype(np.uint8)
+    np.clip(f, 0, 255, out=f)
+    return f.astype(np.uint8)
 
 
 def fit(img, max_dim):

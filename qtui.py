@@ -176,8 +176,25 @@ def spacer():
     return w
 
 
+def wrap_rgb(rgb):
+    """Wrap a contiguous RGB buffer as a QImage *without* copying it.
+
+    Copying is what this avoids: a 2200 px frame cost 18 ms of the GUI thread,
+    ten times a second.
+
+    QImage does not own the memory it is handed. PySide6 does keep the buffer
+    object alive for you — verified, not assumed — but the array is attached to
+    the image as well, so the lifetime is visible in the code that depends on
+    it rather than resting on a binding's internal behaviour.
+    """
+    h, w = rgb.shape[:2]
+    img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+    img._buffer = rgb                  # noqa: SLF001 - deliberate lifetime tie
+    return img
+
+
 def to_qimage(bgr):
-    """BGR ndarray -> QImage that owns its pixels.
+    """BGR ndarray -> QImage that owns its pixels, by copying.
 
     The copy is not optional: QImage wraps the buffer it is given, and the
     numpy array behind a live camera frame is replaced by the next frame.
@@ -321,33 +338,47 @@ class Toast(QLabel):
 
 
 class PreviewView(QWidget):
-    """The stage: an image, the page outline, and draggable corners.
+    """The stage: an image, the page outline, draggable corners, zoom and pan.
 
     Corners are kept in normalised (0..1) image coordinates so they survive the
-    window being resized and mean the same thing on the full-resolution frame
-    as on the preview it was dragged on.
+    window being resized, the view being zoomed, and mean the same thing on the
+    full-resolution frame as on the preview they were dragged on.
     """
 
     corners_changed = Signal(object)
+    zoom_changed = Signal(float)
 
     HANDLE = 9
+    ZOOM_MAX = 16.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("stage")
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         self._img = None
+        self._compare = None            # shown instead, while held
         self._quad = None
         self._editable = False
         self._drag = -1
         self._rect = QRectF()
         self._placeholder = "No camera running"
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self._panning = None
+        self.grid = False
+        self.cross = False
 
     # -- content ---------------------------------------------------
 
     def set_image(self, qimg):
         self._img = qimg
+        self.update()
+
+    def set_compare(self, qimg):
+        """A second image to show while the compare button is held."""
+        self._compare = qimg
         self.update()
 
     def set_quad(self, quad):
@@ -366,22 +397,80 @@ class PreviewView(QWidget):
         self._placeholder = text
         self.update()
 
+    def set_guides(self, grid=None, cross=None):
+        if grid is not None:
+            self.grid = bool(grid)
+        if cross is not None:
+            self.cross = bool(cross)
+        self.update()
+
     def clear(self):
         self._img = None
+        self._compare = None
         self._quad = None
         self.update()
+
+    # -- zoom ------------------------------------------------------
+
+    def zoom(self):
+        return self._zoom
+
+    def fit(self):
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def zoom_by(self, factor, at=None):
+        """Zoom about a point, so what is under the cursor stays under it."""
+        base = self._fit_rect()
+        if base.width() <= 0:
+            return
+        at = at or QPointF(self.width() / 2.0, self.height() / 2.0)
+        r = self._rect if self._rect.width() > 0 else base
+        u = (at.x() - r.x()) / r.width()
+        v = (at.y() - r.y()) / r.height()
+        self._zoom = max(1.0, min(self.ZOOM_MAX, self._zoom * factor))
+        nw, nh = base.width() * self._zoom, base.height() * self._zoom
+        nx, ny = at.x() - u * nw, at.y() - v * nh
+        self._pan = QPointF(nx + nw / 2.0 - base.center().x(),
+                            ny + nh / 2.0 - base.center().y())
+        self._clamp_pan()
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def _clamp_pan(self):
+        """Keep the picture from being dragged off the edge of the stage."""
+        base = self._fit_rect()
+        if base.width() <= 0:
+            return
+        w, h = base.width() * self._zoom, base.height() * self._zoom
+        limit_x = max(0.0, (w - self.width()) / 2.0 + base.x())
+        limit_y = max(0.0, (h - self.height()) / 2.0 + base.y())
+        self._pan = QPointF(max(-limit_x, min(limit_x, self._pan.x())),
+                            max(-limit_y, min(limit_y, self._pan.y())))
 
     # -- geometry --------------------------------------------------
 
     def _fit_rect(self):
-        if self._img is None:
+        img = self._img
+        if img is None:
             return QRectF()
-        iw, ih = self._img.width(), self._img.height()
+        iw, ih = img.width(), img.height()
         if not iw or not ih:
             return QRectF()
         k = min(self.width() / float(iw), self.height() / float(ih))
         w, h = iw * k, ih * k
         return QRectF((self.width() - w) / 2.0, (self.height() - h) / 2.0, w, h)
+
+    def _draw_rect(self):
+        base = self._fit_rect()
+        if base.width() <= 0 or (self._zoom == 1.0 and self._pan.isNull()):
+            return base
+        w, h = base.width() * self._zoom, base.height() * self._zoom
+        cx = base.center().x() + self._pan.x()
+        cy = base.center().y() + self._pan.y()
+        return QRectF(cx - w / 2.0, cy - h / 2.0, w, h)
 
     def _to_widget(self, pt):
         r = self._rect
@@ -399,20 +488,30 @@ class PreviewView(QWidget):
     def paintEvent(self, _e):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#080b0e"))
-        if self._img is None:
+        img = self._compare or self._img
+        if img is None:
             p.setPen(QColor(FG3))
-            f = p.font()
-            f.setPointSize(13)
-            p.setFont(f)
+            font = p.font()
+            font.setPointSize(13)
+            p.setFont(font)
             p.drawText(self.rect(), Qt.AlignCenter, self._placeholder)
             return
 
-        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.setRenderHint(QPainter.Antialiasing, True)
-        self._rect = self._fit_rect()
-        p.drawImage(self._rect, self._img)
+        self._rect = self._draw_rect()
+        # Smooth while shrinking; at high zoom the honest thing is the pixels
+        # themselves, since the whole reason to zoom in is to judge sharpness.
+        p.setRenderHint(QPainter.SmoothPixmapTransform, self._zoom < 2.5)
+        p.drawImage(self._rect, img)
 
-        if self._quad is None or len(self._quad) != 4:
+        if self._compare is not None:
+            self._badge(p, "BEFORE")
+        elif self._zoom > 1.001:
+            self._badge(p, "%d%%" % round(self._zoom * 100))
+
+        self._draw_guides(p)
+
+        if self._quad is None or len(self._quad) != 4 or self._compare is not None:
             return
 
         pts = [self._to_widget(c) for c in self._quad]
@@ -438,6 +537,33 @@ class PreviewView(QWidget):
             p.setPen(QPen(QColor(ACCENT), 2))
             p.drawEllipse(pt, r, r)
 
+    def _badge(self, p, text):
+        p.setPen(QColor(FG))
+        font = p.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        p.setFont(font)
+        box = QRectF(12, 12, 78, 22)
+        p.fillRect(box, QColor(14, 17, 22, 220))
+        p.drawText(box, Qt.AlignCenter, text)
+
+    def _draw_guides(self, p):
+        if not (self.grid or self.cross):
+            return
+        r = self._rect
+        p.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        if self.grid:
+            for i in (1, 2):
+                x = r.x() + r.width() * i / 3.0
+                y = r.y() + r.height() * i / 3.0
+                p.drawLine(QPointF(x, r.y()), QPointF(x, r.bottom()))
+                p.drawLine(QPointF(r.x(), y), QPointF(r.right(), y))
+        if self.cross:
+            c = r.center()
+            p.setPen(QPen(QColor(255, 255, 255, 80), 1))
+            p.drawLine(QPointF(c.x(), r.y()), QPointF(c.x(), r.bottom()))
+            p.drawLine(QPointF(r.x(), c.y()), QPointF(r.right(), c.y()))
+
     # -- interaction -----------------------------------------------
 
     def _hit(self, pos):
@@ -451,14 +577,36 @@ class PreviewView(QWidget):
                 best, best_d = i, d
         return best
 
-    def mousePressEvent(self, e):
-        if not self._editable:
+    def wheelEvent(self, e):
+        step = e.angleDelta().y()
+        if not step:
             return
-        self._drag = self._hit(e.position())
-        self.update()
+        self.zoom_by(1.0016 ** step, e.position())
+        e.accept()
+
+    def mouseDoubleClickEvent(self, _e):
+        self.fit()
+
+    def mousePressEvent(self, e):
+        if self._editable:
+            self._drag = self._hit(e.position())
+            if self._drag >= 0:
+                self.update()
+                return
+        if self._zoom > 1.001:
+            self._panning = (e.position(), QPointF(self._pan))
+            self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
+        if self._panning is not None:
+            start, origin = self._panning
+            self._pan = QPointF(origin.x() + e.position().x() - start.x(),
+                                origin.y() + e.position().y() - start.y())
+            self._clamp_pan()
+            self.update()
+            return
         if not self._editable:
+            self.setCursor(Qt.OpenHandCursor if self._zoom > 1.001 else Qt.ArrowCursor)
             return
         if self._drag < 0:
             self.setCursor(Qt.OpenHandCursor if self._hit(e.position()) >= 0
@@ -471,6 +619,10 @@ class PreviewView(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, _e):
+        if self._panning is not None:
+            self._panning = None
+            self.setCursor(Qt.OpenHandCursor if self._zoom > 1.001 else Qt.ArrowCursor)
+            return
         if self._drag >= 0:
             self._drag = -1
             self.update()
@@ -478,4 +630,5 @@ class PreviewView(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._rect = self._fit_rect()
+        self._clamp_pan()
+        self._rect = self._draw_rect()

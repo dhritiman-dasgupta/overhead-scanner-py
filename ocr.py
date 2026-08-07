@@ -67,7 +67,7 @@ def _fit(img, max_dim):
     return cv2.resize(img, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
 
 
-def recognise(image, lang="eng", psm=3, want_words=True):
+def recognise(image, lang="eng", psm=3, want_words=True):   # noqa: D401
     """Read a processed page.
 
     Returns {'text', 'words': [{text,conf,x0,y0,x1,y1}], 'confidence', 'scale'}.

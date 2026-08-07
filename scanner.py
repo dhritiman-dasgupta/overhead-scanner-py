@@ -8,20 +8,23 @@ the frame you were already looking at. Preview and capture therefore cannot
 disagree about resolution or field of view, because they are the same pixels.
 """
 
+import faulthandler
 import os
 import sys
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame,
-                               QGridLayout, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QMainWindow, QMessageBox,
-                               QScrollArea, QTabWidget, QTextEdit, QVBoxLayout,
-                               QWidget)
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QAction, QGuiApplication, QIcon, QKeySequence, QPixmap,
+                           QPainter)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                               QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+                               QLabel, QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QProgressBar, QScrollArea, QTabWidget,
+                               QTextEdit, QVBoxLayout, QWidget)
 
 import camera
 import detect
@@ -33,9 +36,11 @@ from qtui import (ACCENT, BAD, BG, FG, FG2, FG3, GOOD, LINE, PANEL, PANEL2, QSS,
                   WARN, PreviewView, Section, SliderRow, Toast, button, hair,
                   label, spacer, to_qimage)
 
-PREVIEW_MS   = 70            # display refresh; the camera itself runs ~10 fps
 DETECT_EVERY = 0.40          # seconds between live page detections
-EDIT_MAX     = 1700          # long edge the editor previews at
+PREVIEW_MAX  = 2200          # cap on the long edge sent to the screen
+EDIT_MAX     = 1700          # long edge a settled editor preview renders at
+DRAFT_MAX    = 900           # ...and while a slider is still moving
+SETTLE_MS    = 260           # quiet time before the draft is replaced
 THUMB        = QSize(112, 140)
 A4_INCHES    = 11.69         # long edge, for the dpi readout
 
@@ -64,6 +69,27 @@ SLIDERS = [
 
 OUTSIZES = [("detected", "Fit detected page"), ("native", "Original pixels"),
             ("a4", "A4 · 300 dpi"), ("letter", "Letter · 300 dpi")]
+
+FORMATS = [(".jpg", "JPEG · quality 98", [int(cv2.IMWRITE_JPEG_QUALITY), 98]),
+           (".jpg", "JPEG · quality 92", [int(cv2.IMWRITE_JPEG_QUALITY), 92]),
+           (".png", "PNG · lossless", [int(cv2.IMWRITE_PNG_COMPRESSION), 6]),
+           (".tif", "TIFF · uncompressed", [])]
+
+SHORTCUTS = [
+    ("Space", "Capture the current frame"),
+    ("A", "Auto capture on stillness"),
+    ("C", "Corner editor — drag the four handles"),
+    ("D", "Detect the page again"),
+    ("B", "Hold to compare against the original"),
+    ("[  ]", "Rotate left / right"),
+    ("←  →", "Previous / next page"),
+    ("⌫", "Delete the current page"),
+    ("⌘= ⌘- ⌘0", "Zoom in / out / fit"),
+    ("scroll", "Zoom about the pointer; drag to pan; double-click to fit"),
+    ("⌘S", "Save this page as an image"),
+    ("⌘P", "Save every page as a PDF"),
+    ("⌘R", "Start or stop the camera"),
+]
 
 
 class Page:
@@ -97,6 +123,145 @@ class Job(QObject):
         return self
 
 
+class LiveFeed(QObject):
+    """Scale and detect on a worker thread; the GUI thread only draws.
+
+    Measured on the 16 MP camera, the old arrangement did all of this in the
+    timer callback: 27 ms to downscale a 48 MB frame, 18 ms to turn it into a
+    QImage, and every 400 ms another 28 ms to detect. At ten frames a second
+    that is nearly half the GUI thread, delivered in 45 ms lumps — which is
+    exactly what a stuttering button and a laggy window feel like.
+
+    What crosses the thread boundary is a contiguous RGB buffer, so the GUI can
+    wrap it in a QImage without copying anything.
+    """
+
+    frame = Signal(object, int, int, object, float)   # rgb, src_w, src_h, quad, motion
+    failed = Signal(str)
+
+    DETECT_WORK = 900        # long edge detection runs at
+    MOTION_WORK = 240        # long edge the stillness check runs at
+
+    def __init__(self, cam):
+        super().__init__()
+        self.cam = cam
+        self.target = 1400
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.5)
+            self._thread = None
+
+    def pause(self, on):
+        self._paused.set() if on else self._paused.clear()
+
+    def _work(self):
+        last_seq = -1
+        last_detect = 0.0
+        quad = None
+        miss = 0
+        prev = None
+        motion = 0.0
+        while not self._stop.is_set():
+            if self._paused.is_set() or not self.cam.is_open():
+                time.sleep(0.05)
+                last_seq = -1
+                continue
+            seq = self.cam.sequence()
+            src = self.cam.latest()
+            if src is None or seq == last_seq:
+                time.sleep(0.008)
+                continue
+            last_seq = seq
+
+            now = time.time()
+            if now - last_detect >= DETECT_EVERY:
+                last_detect = now
+                work = imaging.fit(src, self.DETECT_WORK)
+                found = detect.detect(work, sticky=True)
+                if found is not None:
+                    quad, miss = found, 0
+                else:
+                    miss += 1
+                    if miss > 3:
+                        quad = None
+                g = cv2.cvtColor(imaging.fit(work, self.MOTION_WORK), cv2.COLOR_BGR2GRAY)
+                if prev is not None and prev.shape == g.shape:
+                    motion = float(np.mean(cv2.absdiff(g, prev)))
+                prev = g
+
+            small = imaging.fit(src, self.target)
+            rgb = np.ascontiguousarray(small[:, :, ::-1])
+            self.frame.emit(rgb, src.shape[1], src.shape[0],
+                            None if quad is None else quad.copy(), motion)
+
+    def _loop(self):
+        """Guarded wrapper. An exception in here used to kill the thread and
+        freeze the preview for good, with nothing on screen to say why."""
+        while not self._stop.is_set():
+            try:
+                self._work()
+            except Exception as exc:                # noqa: BLE001
+                self.failed.emit(str(exc))
+                time.sleep(0.25)
+
+
+class Renderer(QObject):
+    """One background renderer for the editor, newest request wins.
+
+    Coalescing rather than queueing is the point: dragging a slider produces
+    dozens of requests and only the last one is worth anything. A queue would
+    render every intermediate value and finish seconds after the drag ended.
+    """
+
+    ready = Signal(object, int)      # bgr image, request id
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._req = None
+        self._wake = threading.Event()
+        self._stop = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def request(self, rid, frame, adjust, corners, max_dim, fast):
+        with self._lock:
+            self._req = (rid, frame, dict(adjust),
+                         None if corners is None else np.array(corners), max_dim, fast)
+        self._wake.set()
+
+    def stop(self):
+        self._stop = True
+        self._wake.set()
+
+    def _loop(self):
+        while not self._stop:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                req = self._req
+                self._req = None
+            if req is None or self._stop:
+                continue
+            try:
+                rid, frame, adjust, corners, max_dim, fast = req
+                img = imaging.process(frame, adjust, corners, max_dim=max_dim, fast=fast)
+            except Exception:                       # noqa: BLE001 - stale request
+                continue
+            self.ready.emit(img, rid)
+
+
 class App(QMainWindow):
 
     def __init__(self):
@@ -118,27 +283,46 @@ class App(QMainWindow):
         self._scanning = False
 
         self.live_quad = None
-        self._quad_miss = 0
-        self._last_detect = 0.0
-        self._last_seq = -1
-        self._prev_small = None
         self._still_since = 0.0
         self._auto_last = 0.0
+        self._rgb = None            # buffer the on-screen QImage points into
+        self._compare_rgb = None
+        self._comparing = False
+        self._want_camera = ""      # name remembered from the last session
+        self._fps_at = (0.0, 0)
+        self._rid = 0               # newest render request
+        self._uncropped = None      # cached full view, for corner dragging
         self._jobs = []
         self.sliders = {}
         self.filter_buttons = {}
 
+        # Built before the widgets: set_mode() talks to the feed, and the
+        # window starts in live mode.
+        self.feed = LiveFeed(self.cam)
+        self.feed.frame.connect(self._live_frame)
+        self.feed.failed.connect(
+            lambda msg: self.toast.show_message("Preview: %s" % msg, "bad"))
+        self.renderer = Renderer()
+        self.renderer.ready.connect(self._rendered)
+
         self._build()
+        self._menus()
+        self._restore_state()
         self._sync_controls()
         self.set_mode("live")
+        self.feed.start()
 
+        # A slow heartbeat, only to notice a camera that has died. Frames
+        # arrive by signal now, not by polling.
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(PREVIEW_MS)
+        self.timer.timeout.connect(self._health)
+        self.timer.start(500)
 
-        self.repro = QTimer(self)
-        self.repro.setSingleShot(True)
-        self.repro.timeout.connect(self._render_page)
+        # Fires once the operator stops moving a slider: swaps the draft for a
+        # full-quality render and refreshes the thumbnail.
+        self.settle = QTimer(self)
+        self.settle.setSingleShot(True)
+        self.settle.timeout.connect(self._settled)
 
         QTimer.singleShot(120, self.rescan)
 
@@ -274,6 +458,19 @@ class App(QMainWindow):
         lay.addWidget(self.btn_corners)
         lay.addWidget(button("Detect", self.redetect, tip="Find the page again  (D)"))
         lay.addWidget(button("Delete", self.delete_page, kind="ghost", tip="⌫"))
+
+        lay.addSpacing(10)
+        self.btn_compare = button("Before", None, kind="ghost",
+                                  tip="Hold to see the unprocessed page  (B)")
+        self.btn_compare.pressed.connect(lambda: self.compare(True))
+        self.btn_compare.released.connect(lambda: self.compare(False))
+        lay.addWidget(self.btn_compare)
+        for text, tip, fn in (("−", "Zoom out  (⌘-)", lambda: self.zoom(1 / 1.4)),
+                              ("+", "Zoom in  (⌘=)", lambda: self.zoom(1.4)),
+                              ("Fit", "Fit to the window  (⌘0)", self.preview_fit)):
+            b = button(text, fn, kind="ghost", tip=tip)
+            b.setFixedWidth(46 if text == "Fit" else 30)
+            lay.addWidget(b)
         col.addWidget(bar)
         col.addWidget(hair())
 
@@ -292,6 +489,21 @@ class App(QMainWindow):
         fl.addStretch(1)
         self.lbl_hint = label("", "note")
         fl.addWidget(self.lbl_hint)
+        # How still the scene is. Auto capture fires when this empties, and
+        # without a meter that moment is invisible — you end up guessing why
+        # nothing fired, or why it fired early.
+        fl.addSpacing(10)
+        self.motion = QProgressBar()
+        self.motion.setRange(0, 100)
+        self.motion.setFixedWidth(70)
+        self.motion.setTextVisible(False)
+        self.motion.setToolTip("Scene movement")
+        self.motion.hide()
+        fl.addWidget(self.motion)
+        self.lbl_fps = label("", "note")
+        self.lbl_fps.setFixedWidth(46)
+        self.lbl_fps.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        fl.addWidget(self.lbl_fps)
         col.addWidget(foot)
         return wrap
 
@@ -339,6 +551,9 @@ class App(QMainWindow):
         col.addWidget(sec)
 
         sec = Section("Output size")
+        self.chk_invert = QCheckBox("Invert (negatives, chalkboards)")
+        self.chk_invert.toggled.connect(self._invert_changed)
+        sec.add(self.chk_invert)
         self.outsize = QComboBox()
         for _key, text in OUTSIZES:
             self.outsize.addItem(text)
@@ -356,8 +571,13 @@ class App(QMainWindow):
             col.addWidget(sec)
 
         col.addWidget(hair())
-        sec = Section("All pages")
-        sec.add(button("Apply these settings to every page", self.apply_all))
+        sec = Section("Apply")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(button("Reset all", self.reset_adjust,
+                             tip="Back to the filter's own settings"))
+        row.addWidget(button("To every page", self.apply_all))
+        sec.add_layout(row)
         col.addWidget(sec)
         col.addStretch(1)
         return page
@@ -370,17 +590,36 @@ class App(QMainWindow):
         col.setSpacing(0)
 
         sec = Section("This page")
-        sec.add(button("Save image…", self.export_image, kind="primary",
-                       tip="⌘S"))
-        note = label("Always the full resolution of the crop. JPEG is written at "
-                     "quality 98; choose PNG or TIFF for no compression at all.",
-                     "note")
-        note.setWordWrap(True)
-        sec.add(note)
+        self.fmt = QComboBox()
+        for _ext, text, _params in FORMATS:
+            self.fmt.addItem(text)
+        sec.add(self.fmt)
+        sec.add(button("Save image…", self.export_image, kind="primary", tip="⌘S"))
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(button("Copy", self.copy_image, tip="Put the page on the clipboard"))
+        row.addWidget(button("Print…", self.print_page))
+        row.addWidget(button("Estimate", self.estimate,
+                             tip="Render it and report the real file size"))
+        sec.add_layout(row)
+        self.lbl_estimate = label("Saved at the crop's full resolution — never "
+                                  "downscaled.", "note")
+        self.lbl_estimate.setWordWrap(True)
+        sec.add(self.lbl_estimate)
         col.addWidget(sec)
 
         col.addWidget(hair())
         sec = Section("All pages")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.pdf_size = QComboBox()
+        self.pdf_size.addItems(["A4", "Letter"])
+        row.addWidget(self.pdf_size)
+        self.chk_searchable = QCheckBox("Searchable")
+        self.chk_searchable.setChecked(True)
+        self.chk_searchable.setToolTip("Embed the OCR text as an invisible layer")
+        row.addWidget(self.chk_searchable)
+        sec.add_layout(row)
         sec.add(button("Save PDF…", self.export_pdf, kind="primary", tip="⌘P"))
         sec.add(button("Save text…", self.export_text))
         col.addWidget(sec)
@@ -389,8 +628,25 @@ class App(QMainWindow):
         sec = Section("OCR")
         row = QHBoxLayout()
         row.setSpacing(4)
+        self.ocr_lang = QComboBox()
+        langs = ocr.languages() or ["eng"]
+        self.ocr_lang.addItems(langs)
+        if "eng" in langs:
+            self.ocr_lang.setCurrentText("eng")
+        self.ocr_lang.setToolTip("Recognition language")
+        row.addWidget(self.ocr_lang, 1)
+        self.ocr_psm = QComboBox()
+        for code, text in (("3", "Auto layout"), ("4", "Columns"), ("6", "One block"),
+                           ("11", "Sparse text"), ("1", "Auto + orientation")):
+            self.ocr_psm.addItem(text, code)
+        self.ocr_psm.setToolTip("Page segmentation — how the layout is read")
+        row.addWidget(self.ocr_psm, 1)
+        sec.add_layout(row)
+        row = QHBoxLayout()
+        row.setSpacing(4)
         row.addWidget(button("Read page", self.run_ocr))
         row.addWidget(button("Read all", self.run_ocr_all))
+        row.addWidget(button("Copy text", self.copy_text))
         sec.add_layout(row)
         self.lbl_ocr = label("", "note")
         self.lbl_ocr.setWordWrap(True)
@@ -409,6 +665,7 @@ class App(QMainWindow):
         return page
 
     def _shortcuts(self):
+        """Single-key actions. The menu bar carries the ⌘ ones."""
         def act(seq, fn):
             a = QAction(self)
             a.setShortcut(QKeySequence(seq))
@@ -422,11 +679,112 @@ class App(QMainWindow):
         act("[", lambda: self.rotate(-90))
         act("]", lambda: self.rotate(90))
         act("Backspace", self.delete_page)
-        act("Ctrl+S", self.export_image)
-        act("Ctrl+P", self.export_pdf)
-        act("Ctrl+R", self.toggle_camera)
         act("Left", lambda: self.step_page(-1))
         act("Right", lambda: self.step_page(1))
+
+        hold = QAction(self)
+        hold.setShortcut(QKeySequence("B"))
+        hold.triggered.connect(lambda *_: self.compare(not self._comparing))
+        self.addAction(hold)
+
+    def _menus(self):
+        """A real menu bar. On macOS its absence is what makes an app feel
+        like a script someone left running."""
+        bar = self.menuBar()
+
+        def add(menu, text, fn, seq=None, checkable=False):
+            a = QAction(text, self)
+            if seq:
+                a.setShortcut(QKeySequence(seq))
+            a.setCheckable(checkable)
+            a.triggered.connect(lambda *_: fn())
+            menu.addAction(a)
+            return a
+
+        m = bar.addMenu("&File")
+        add(m, "Import images…", self.import_images, "Ctrl+O")
+        m.addSeparator()
+        add(m, "Save Image…", self.export_image, "Ctrl+S")
+        add(m, "Save PDF…", self.export_pdf, "Ctrl+P")
+        add(m, "Save Text…", self.export_text)
+        m.addSeparator()
+        add(m, "Print…", self.print_page, "Ctrl+Shift+P")
+
+        m = bar.addMenu("&Edit")
+        add(m, "Copy Image", self.copy_image, "Ctrl+C")
+        add(m, "Copy Text", self.copy_text, "Ctrl+Shift+C")
+        m.addSeparator()
+        add(m, "Reset Adjustments", self.reset_adjust)
+        add(m, "Apply to Every Page", self.apply_all)
+        add(m, "Delete Page", self.delete_page)
+        add(m, "Clear All Pages", self.clear_pages)
+
+        m = bar.addMenu("&View")
+        add(m, "Zoom In", lambda: self.zoom(1.4), "Ctrl+=")
+        add(m, "Zoom Out", lambda: self.zoom(1 / 1.4), "Ctrl+-")
+        add(m, "Fit to Window", self.preview_fit, "Ctrl+0")
+        m.addSeparator()
+        self.act_grid = add(m, "Thirds Grid",
+                            lambda: self.preview.set_guides(grid=self.act_grid.isChecked()),
+                            "Ctrl+G", checkable=True)
+        self.act_cross = add(m, "Centre Cross",
+                             lambda: self.preview.set_guides(cross=self.act_cross.isChecked()),
+                             checkable=True)
+
+        m = bar.addMenu("&Camera")
+        add(m, "Start / Stop", self.toggle_camera, "Ctrl+R")
+        add(m, "Rescan Devices", self.rescan)
+        add(m, "Try Full Resolution", self.upgrade_camera)
+        m.addSeparator()
+        add(m, "Capture", self.capture)
+        add(m, "Auto Capture", self.toggle_auto)
+
+        m = bar.addMenu("&Help")
+        add(m, "Keyboard Shortcuts", self.show_help, "Ctrl+/")
+
+    def show_help(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard shortcuts")
+        dlg.setStyleSheet(QSS)
+        col = QVBoxLayout(dlg)
+        col.setContentsMargins(22, 18, 22, 18)
+        col.setSpacing(9)
+        col.addWidget(label("Keyboard shortcuts", "title"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        for i, (keys, what) in enumerate(SHORTCUTS):
+            k = label(keys, "badge")
+            k.setStyleSheet("color: %s; font-family: Menlo; font-size: 11px;" % ACCENT)
+            grid.addWidget(k, i, 0, Qt.AlignRight)
+            grid.addWidget(label(what, "sublabel"), i, 1)
+        col.addLayout(grid)
+        col.addSpacing(6)
+        close = button("Close", dlg.accept, kind="primary")
+        col.addWidget(close, 0, Qt.AlignRight)
+        dlg.exec()
+
+    # ══ window state ═════════════════════════════════════════════
+
+    def _restore_state(self):
+        st = QSettings("overhead-scanner", "app")
+        geo = st.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        self.act_grid.setChecked(st.value("grid", False, type=bool))
+        self.act_cross.setChecked(st.value("cross", False, type=bool))
+        self.preview.set_guides(grid=self.act_grid.isChecked(),
+                                cross=self.act_cross.isChecked())
+        want = st.value("camera", "", type=str)
+        if want:
+            self._want_camera = want
+
+    def _save_state(self):
+        st = QSettings("overhead-scanner", "app")
+        st.setValue("geometry", self.saveGeometry())
+        st.setValue("grid", self.act_grid.isChecked())
+        st.setValue("cross", self.act_cross.isChecked())
+        st.setValue("camera", self.cam.name or "")
 
     # ══ camera ═══════════════════════════════════════════════════
 
@@ -462,10 +820,17 @@ class App(QMainWindow):
                    "continuity": "iPhone"}.get(d["kind"], "")
             text = "%s  ·  %s" % (d["name"], tag) if tag else d["name"]
             self.device_box.addItem(text, d["index"])
-        if was is not None:
-            i = self.device_box.findData(was)
+        # Prefer the camera in use, then the one from last session, then the
+        # best-ranked device.
+        for wanted in (was, self._want_camera):
+            if wanted in (None, ""):
+                continue
+            i = (self.device_box.findData(wanted) if isinstance(wanted, int)
+                 else self.device_box.findText(str(wanted), Qt.MatchStartsWith))
             if i >= 0:
                 self.device_box.setCurrentIndex(i)
+                break
+        self._want_camera = ""
         self.device_box.blockSignals(False)
 
         if not self.devices:
@@ -576,7 +941,6 @@ class App(QMainWindow):
         self.live = self.cam.is_open()
         self.lbl_state.setText(self.cam.name if self.live else "stopped")
         self._update_res()
-        self._last_seq = -1
         if ok:
             self.toast.show_message("Now at %d×%d" % (self.cam.width, self.cam.height),
                                     "good")
@@ -606,46 +970,43 @@ class App(QMainWindow):
 
     # ══ live loop ════════════════════════════════════════════════
 
-    def _tick(self):
-        if self.mode != "live":
-            return
-        # Only react to a camera that *was* running and has died. Testing
-        # `cam.error` alone also fires while a failed open is being retried,
-        # and overwrote the reason on screen with a bare "stopped".
+    def _health(self):
+        """Notice a camera that was running and has died.
+
+        Testing `cam.error` alone also fires while a failed open is being
+        retried, and used to overwrite the reason on screen with a bare
+        "stopped".
+        """
         if self.live and not self.busy and self.cam.error and not self.cam.is_open():
             msg = self.cam.error
             self.stop_camera()
             self.toast.show_message(msg, "bad")
             return
-        frame = self.cam.latest()
-        if frame is None:
+        # Frame rate, from the camera's own counter — the honest number, not
+        # how often the window happens to repaint.
+        now, seq = time.time(), self.cam.sequence()
+        was_at, was_seq = self._fps_at
+        if self.cam.is_open() and was_at and now > was_at:
+            self.lbl_fps.setText("%.0f fps" % ((seq - was_seq) / (now - was_at)))
+        elif not self.cam.is_open():
+            self.lbl_fps.setText("")
+        self._fps_at = (now, seq)
+
+    def _live_frame(self, rgb, src_w, src_h, quad, motion):
+        if self.mode != "live":
             return
-        seq = self.cam.sequence()
-        if seq == self._last_seq:
-            return
-        self._last_seq = seq
+        # Hold the buffer: the QImage points straight into it rather than
+        # copying, and letting it be collected would paint garbage.
+        self._rgb = rgb
+        self.preview.set_image(qtui.wrap_rgb(rgb))
+        self.preview.set_quad(quad)
+        self.live_quad = quad
+        self._live_info(src_w, src_h)
+        self._check_still(motion)
+        if self.auto:
+            self.motion.setValue(int(min(100, motion * 18)))
 
-        now = time.time()
-        if now - self._last_detect >= DETECT_EVERY:
-            self._last_detect = now
-            small = imaging.fit(frame, 900)
-            quad = detect.detect(small, sticky=True)
-            if quad is not None:
-                self.live_quad = quad
-                self._quad_miss = 0
-            else:
-                self._quad_miss += 1
-                if self._quad_miss > 3:
-                    self.live_quad = None
-            self._check_still(small)
-
-        view = imaging.fit(frame, max(640, self.preview.width() * 2))
-        self.preview.set_image(to_qimage(view))
-        self.preview.set_quad(self.live_quad)
-        self._live_info(frame)
-
-    def _live_info(self, frame):
-        h, w = frame.shape[:2]
+    def _live_info(self, w, h):
         if self.live_quad is None:
             self.lbl_info.setText("live %d×%d  ·  no page found — the whole frame "
                                   "will be kept" % (w, h))
@@ -670,30 +1031,26 @@ class App(QMainWindow):
         x, y = p[:, 0], p[:, 1]
         return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2.0
 
-    def _check_still(self, small):
+    def _check_still(self, motion):
         """Auto capture fires once the scene stops moving, not on a timer.
 
         A page turn is a burst of change followed by stillness; shooting on
         stillness is what makes a stack of pages a rhythm rather than a chore.
         """
         if not self.auto:
-            self._prev_small = None
             return
-        g = cv2.cvtColor(imaging.fit(small, 240), cv2.COLOR_BGR2GRAY)
         now = time.time()
-        if self._prev_small is not None and self._prev_small.shape == g.shape:
-            diff = float(np.mean(cv2.absdiff(g, self._prev_small)))
-            if diff > 2.4:
-                self._still_since = now
-            elif (now - self._still_since > 1.1 and now - self._auto_last > 2.6
-                    and self.live_quad is not None):
-                self._auto_last = now
-                self.capture()
-        self._prev_small = g
+        if motion > 2.4:
+            self._still_since = now
+        elif (now - self._still_since > 1.1 and now - self._auto_last > 2.6
+                and self.live_quad is not None):
+            self._auto_last = now
+            self.capture()
 
     def toggle_auto(self):
         self.auto = not self.auto
         self.btn_auto.setChecked(self.auto)
+        self.motion.setVisible(self.auto)
         self._still_since = time.time()
         self.toast.show_message("Auto capture on — hold still after each page"
                                 if self.auto else "Auto capture off")
@@ -857,9 +1214,11 @@ class App(QMainWindow):
                                          if not self.cam.is_open() else "Starting…")
             if not self.cam.is_open():
                 self.preview.clear()
-            self._last_seq = -1
         else:
+            self._uncropped = None
             self._render_page()
+        # No point scaling 16 MP frames nobody is looking at.
+        self.feed.pause(mode != "live")
 
     def toggle_corners(self):
         if self.mode != "edit" or self.page() is None:
@@ -872,14 +1231,19 @@ class App(QMainWindow):
         if on and page.corners is None:
             page.corners = detect.full_frame().copy()
         self.preview.set_editable(on)
+        self._compare_rgb = None
+        self._uncropped = None if on else self._uncropped
         self._render_page()
+        if not on:
+            self._refresh_thumb(self.current)
 
     def _corners_dragged(self, quad):
         page = self.page()
         if page is None:
             return
         page.corners = np.asarray(quad, dtype=np.float32)
-        self._render_page()
+        self._page_info(page)
+        self.settle.start(SETTLE_MS)
 
     def redetect(self):
         page = self.page()
@@ -888,37 +1252,53 @@ class App(QMainWindow):
             return
         quad = detect.detect(imaging.fit(page.frame, 900))
         page.corners = quad
+        self._uncropped = None
         self._render_page()
+        self.settle.start(SETTLE_MS)
         self.toast.show_message("Page found" if quad is not None else
                                 "No page found — use Corners",
                                 "good" if quad is not None else "warn")
 
     # ══ rendering the editor ═════════════════════════════════════
 
-    def _render_page(self):
+    def _render_page(self, draft=False):
+        """Ask the background renderer for the current page.
+
+        Nothing here touches the pipeline: a full-quality editor render is
+        ~240 ms on a 16 MP frame, which on the GUI thread is a quarter-second
+        freeze for every slider tick. Requests coalesce, so a drag produces one
+        render per completed frame instead of a backlog.
+        """
         page = self.page()
         if page is None or self.mode != "edit":
             return
-        editing = self.preview.is_editable()
-        if editing:
+        self._page_info(page)
+        if self.preview.is_editable():
             # While the corners are being dragged, show the uncropped frame —
             # you cannot place a corner on a picture the corners already cut.
-            view = imaging.fit(page.frame, max(700, self.preview.width() * 2))
-            self.preview.set_image(to_qimage(view))
+            # Cached, because it does not change while you drag.
+            if self._uncropped is None:
+                small = imaging.fit(page.frame, max(700, self.preview.width() * 2))
+                self._uncropped = np.ascontiguousarray(small[:, :, ::-1])
+            self._rgb = self._uncropped
+            self.preview.set_image(qtui.wrap_rgb(self._uncropped))
             self.preview.set_quad(page.corners if page.corners is not None
                                   else detect.full_frame())
-        else:
-            limit = max(700, min(EDIT_MAX, self.preview.width() * 2))
-            try:
-                img = imaging.process(page.frame, page.adjust, page.corners,
-                                      max_dim=limit)
-            except Exception as exc:                # noqa: BLE001
-                self.toast.show_message("Preview failed: %s" % exc, "bad")
-                return
-            self.preview.set_image(to_qimage(img))
-            self.preview.set_quad(None)
-        self._page_info(page)
-        self._refresh_thumb(self.current)
+            return
+        if not draft:
+            self._compare_rgb = None
+        self._rid += 1
+        limit = (DRAFT_MAX if draft
+                 else max(700, min(EDIT_MAX, self.preview.width() * 2)))
+        self.renderer.request(self._rid, page.frame, page.adjust, page.corners,
+                              limit, draft)
+
+    def _rendered(self, img, rid):
+        if rid != self._rid or self.mode != "edit" or self.preview.is_editable():
+            return                      # superseded, or no longer on screen
+        self._rgb = np.ascontiguousarray(img[:, :, ::-1])
+        self.preview.set_image(qtui.wrap_rgb(self._rgb))
+        self.preview.set_quad(None)
 
     def _page_info(self, page):
         fh, fw = page.frame.shape[:2]
@@ -930,7 +1310,14 @@ class App(QMainWindow):
         self.lbl_hint.setStyleSheet("color: %s;" % ACCENT)
 
     def _queue_render(self):
-        self.repro.start(110)
+        """A knob moved: draft now, full quality and a new thumbnail on stop."""
+        self._compare_rgb = None
+        self._render_page(draft=True)
+        self.settle.start(SETTLE_MS)
+
+    def _settled(self):
+        self._render_page(draft=False)
+        self._refresh_thumb(self.current)
 
     # ══ adjustments ══════════════════════════════════════════════
 
@@ -944,6 +1331,9 @@ class App(QMainWindow):
                           default=preset.get(key, imaging.DEFAULTS[key]))
         for key, b in self.filter_buttons.items():
             b.setChecked(key == a.get("filter") and not a.get("custom"))
+        self.chk_invert.blockSignals(True)
+        self.chk_invert.setChecked(bool(a.get("invert")))
+        self.chk_invert.blockSignals(False)
         self.outsize.blockSignals(True)
         keys = [k for k, _ in OUTSIZES]
         self.outsize.setCurrentIndex(keys.index(a.get("outsize", "detected"))
@@ -957,7 +1347,7 @@ class App(QMainWindow):
             return
         page.adjust[key] = value
         page.adjust["custom"] = True
-        for k, b in self.filter_buttons.items():
+        for _k, b in self.filter_buttons.items():
             b.setChecked(False)
         self._queue_render()
 
@@ -971,13 +1361,15 @@ class App(QMainWindow):
         page.adjust["custom"] = False
         self._sync_controls()
         self._render_page()
+        self.settle.start(SETTLE_MS)
 
     def _outsize_changed(self, i):
         page = self.page()
         if page is None:
             return
         page.adjust["outsize"] = OUTSIZES[i][0]
-        self._queue_render()
+        self._render_page()
+        self.settle.start(SETTLE_MS)
 
     def rotate(self, deg):
         page = self.page()
@@ -985,6 +1377,7 @@ class App(QMainWindow):
             return
         page.adjust["rotate"] = (page.adjust.get("rotate", 0) + deg) % 360
         self._render_page()
+        self.settle.start(SETTLE_MS)
 
     def flip(self, key):
         page = self.page()
@@ -992,6 +1385,7 @@ class App(QMainWindow):
             return
         page.adjust[key] = not page.adjust.get(key, False)
         self._render_page()
+        self.settle.start(SETTLE_MS)
 
     def apply_all(self):
         page = self.page()
@@ -1010,7 +1404,132 @@ class App(QMainWindow):
             self._refresh_thumb(i)
         self.toast.show_message("Applied to %d pages" % len(self.pages), "good")
 
+    # ══ view ═════════════════════════════════════════════════════
+
+    def zoom(self, factor):
+        self.preview.zoom_by(factor)
+
+    def preview_fit(self):
+        self.preview.fit()
+
+    def compare(self, on):
+        """Hold to see the page before any processing.
+
+        The single most useful check there is: it answers "is the filter
+        helping or inventing?" in one keypress, which no amount of staring at
+        the processed image will.
+        """
+        page = self.page()
+        if on and (page is None or self.mode != "edit"):
+            return
+        self._comparing = bool(on)
+        self.btn_compare.setDown(self._comparing)
+        if not on:
+            self.preview.set_compare(None)
+            return
+        if self._compare_rgb is None:
+            a = dict(page.adjust)
+            imaging.set_filter(a, "original")
+            for k in imaging.GEOMETRY_KEYS:            # keep the crop and rotation
+                a[k] = page.adjust.get(k, imaging.DEFAULTS[k])
+            img = imaging.process(page.frame, a, page.corners, max_dim=DRAFT_MAX,
+                                  fast=True)
+            self._compare_rgb = np.ascontiguousarray(img[:, :, ::-1])
+        self.preview.set_compare(qtui.wrap_rgb(self._compare_rgb))
+
+    def _invert_changed(self, on):
+        page = self.page()
+        if page is None:
+            return
+        page.adjust["invert"] = bool(on)
+        self._render_page()
+        self.settle.start(SETTLE_MS)
+
+    def reset_adjust(self):
+        page = self.page()
+        if page is None:
+            return
+        imaging.set_filter(page.adjust, page.adjust.get("filter", "auto"))
+        page.adjust["custom"] = False
+        self._sync_controls()
+        self._render_page()
+        self.settle.start(SETTLE_MS)
+        self.toast.show_message("Back to the %s filter's own settings"
+                                % page.adjust.get("filter", "auto"))
+
+    # ══ clipboard and printing ═══════════════════════════════════
+
+    def copy_image(self):
+        page = self.page()
+        if page is None:
+            self.toast.show_message("Nothing to copy", "warn")
+            return
+        self._start_job("Rendering…", self._to_clipboard, page)
+
+    def _to_clipboard(self, page):
+        img = self._full(page)
+        rgb = np.ascontiguousarray(img[:, :, ::-1])
+        # Copy: the clipboard outlives this array.
+        QGuiApplication.clipboard().setImage(qtui.wrap_rgb(rgb).copy())
+        return "%d×%d to the clipboard" % (img.shape[1], img.shape[0])
+
+    def copy_text(self):
+        text = self.txt_ocr.toPlainText()
+        if not text.strip():
+            self.toast.show_message("No text yet — press Read page", "warn")
+            return
+        QGuiApplication.clipboard().setText(text)
+        self.toast.show_message("%d characters copied" % len(text), "good")
+
+    def print_page(self):
+        page = self.page()
+        if page is None:
+            self.toast.show_message("Nothing to print", "warn")
+            return
+        try:
+            from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        except ImportError:
+            self.toast.show_message("Printing needs PySide6-Addons", "bad")
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        if QPrintDialog(printer, self).exec() != QDialog.Accepted:
+            return
+        img = imaging.process(page.frame, page.adjust, page.corners, max_dim=3000)
+        rgb = np.ascontiguousarray(img[:, :, ::-1])
+        qimg = qtui.wrap_rgb(rgb)
+        painter = QPainter(printer)
+        area = painter.viewport()
+        size = qimg.size()
+        size.scale(area.size(), Qt.KeepAspectRatio)
+        painter.setViewport(area.x(), area.y(), size.width(), size.height())
+        painter.setWindow(qimg.rect())
+        painter.drawImage(0, 0, qimg)
+        painter.end()
+        self.toast.show_message("Sent to the printer", "good")
+
     # ══ export ═══════════════════════════════════════════════════
+
+    def _format(self):
+        return FORMATS[max(0, self.fmt.currentIndex())]
+
+    def estimate(self):
+        page = self.page()
+        if page is None:
+            self.toast.show_message("Nothing to measure", "warn")
+            return
+        self.lbl_estimate.setText("rendering at full resolution…")
+        self._start_job("Estimating…", self._estimate, page, quiet="estimate")
+
+    def _estimate(self, page):
+        ext, name, params = self._format()
+        img = self._full(page)
+        ok, buf = cv2.imencode(ext, img, params)
+        if not ok:
+            raise RuntimeError("could not encode %s" % ext)
+        dpi = max(img.shape[:2]) / A4_INCHES
+        return ("%d×%d  ·  %.1f MP  ·  %s  ·  %.1f MB  ·  ≈%d dpi on A4"
+                % (img.shape[1], img.shape[0], img.shape[0] * img.shape[1] / 1e6,
+                   name.split(" · ")[0], len(buf) / 1e6, round(dpi)))
 
     def _full(self, page):
         return imaging.process(page.frame, page.adjust, page.corners)
@@ -1020,9 +1539,10 @@ class App(QMainWindow):
         if page is None:
             self.toast.show_message("Nothing to save", "warn")
             return
+        ext, _name, _params = self._format()
         path, _ = QFileDialog.getSaveFileName(
             self, "Save image", os.path.join(os.path.expanduser("~/Desktop"),
-                                             page.name.replace(" ", "-").lower() + ".jpg"),
+                                             page.name.replace(" ", "-").lower() + ext),
             "JPEG (*.jpg);;PNG (*.png);;TIFF (*.tif)")
         if not path:
             return
@@ -1030,13 +1550,16 @@ class App(QMainWindow):
 
     def _write_image(self, page, path):
         img = self._full(page)
+        chosen, _name, params = self._format()
         ext = os.path.splitext(path)[1].lower()
-        params = [int(cv2.IMWRITE_JPEG_QUALITY), 98] if ext in (".jpg", ".jpeg") else []
+        if ext != chosen:
+            params = ([int(cv2.IMWRITE_JPEG_QUALITY), 98]
+                      if ext in (".jpg", ".jpeg") else [])
         if not cv2.imwrite(path, img, params):
             raise RuntimeError("could not write %s" % path)
-        return "%s  ·  %d×%d  ·  %.1f MB" % (os.path.basename(path), img.shape[1],
-                                             img.shape[0],
-                                             os.path.getsize(path) / 1e6)
+        return "Saved %s  ·  %d×%d  ·  %.1f MB" % (
+            os.path.basename(path), img.shape[1], img.shape[0],
+            os.path.getsize(path) / 1e6)
 
     def export_pdf(self):
         if not self.pages:
@@ -1047,9 +1570,11 @@ class App(QMainWindow):
             "PDF (*.pdf)")
         if not path:
             return
-        self._start_job("Building PDF…", self._write_pdf, list(self.pages), path)
+        self._start_job("Building PDF…", self._write_pdf, list(self.pages), path,
+                        self.pdf_size.currentText().lower(),
+                        self.chk_searchable.isChecked())
 
-    def _write_pdf(self, pages, path):
+    def _write_pdf(self, pages, path, size="a4", searchable=True):
         out = []
         for page in pages:
             img = self._full(page)
@@ -1064,11 +1589,11 @@ class App(QMainWindow):
                          for w in page.ocr.get("words", [])]
             out.append({"jpeg": buf.tobytes(), "width": img.shape[1],
                         "height": img.shape[0], "words": words})
-        data = pdfwriter.build(out, page_size="a4", title="Scan",
-                               searchable=any(p["words"] for p in out))
+        data = pdfwriter.build(out, page_size=size, title="Scan",
+                               searchable=searchable and any(p["words"] for p in out))
         with open(path, "wb") as fh:
             fh.write(data)
-        return "%s  ·  %d page%s  ·  %.1f MB" % (
+        return "Saved %s  ·  %d page%s  ·  %.1f MB" % (
             os.path.basename(path), len(out), "" if len(out) == 1 else "s",
             len(data) / 1e6)
 
@@ -1098,7 +1623,8 @@ class App(QMainWindow):
             self.toast.show_message("Tesseract is not installed", "bad")
             return
         self.lbl_ocr.setText("reading…")
-        self._start_job("Reading…", self._read, [page], quiet=True)
+        self._start_job("Reading…", self._read, [page], self.ocr_lang.currentText(),
+                        int(self.ocr_psm.currentData()), quiet="ocr")
 
     def run_ocr_all(self):
         if not self.pages:
@@ -1107,13 +1633,15 @@ class App(QMainWindow):
             self.toast.show_message("Tesseract is not installed", "bad")
             return
         self.lbl_ocr.setText("reading %d pages…" % len(self.pages))
-        self._start_job("Reading…", self._read, list(self.pages), quiet=True)
+        self._start_job("Reading…", self._read, list(self.pages),
+                        self.ocr_lang.currentText(), int(self.ocr_psm.currentData()),
+                        quiet="ocr")
 
-    def _read(self, pages):
+    def _read(self, pages, lang="eng", psm=3):
         confs = []
         for page in pages:
             img = imaging.process(page.frame, page.adjust, page.corners, max_dim=2600)
-            page.ocr = ocr.recognise(img)
+            page.ocr = ocr.recognise(img, lang=lang, psm=psm)
             if page.ocr.get("confidence") is not None:
                 confs.append(page.ocr["confidence"])
         return confs
@@ -1149,12 +1677,19 @@ class App(QMainWindow):
         self.lbl_state.setText(self.cam.name if self.cam.is_open() else "stopped")
         if err is not None:
             self.toast.show_message(str(err), "bad")
-            self.lbl_ocr.setText(str(err))
+            if quiet == "ocr":
+                self.lbl_ocr.setText(str(err))
+                self.lbl_ocr.setStyleSheet("color: %s;" % BAD)
+            elif quiet == "estimate":
+                self.lbl_estimate.setText(str(err))
             return
-        if quiet:
+        if quiet == "estimate":
+            self.lbl_estimate.setText(result)
+            self.lbl_estimate.setStyleSheet("color: %s;" % FG2)
+            return
+        if quiet == "ocr":
             page = self.page()
-            text = (page.ocr or {}).get("text", "") if page else ""
-            self.txt_ocr.setPlainText(text)
+            self.txt_ocr.setPlainText((page.ocr or {}).get("text", "") if page else "")
             confs = result or []
             self.lbl_ocr.setText(
                 "%d page%s read · mean confidence %d%%"
@@ -1162,23 +1697,59 @@ class App(QMainWindow):
                    round(sum(confs) / len(confs))) if confs else "no text found")
             self.lbl_ocr.setStyleSheet("color: %s;" % (GOOD if confs else WARN))
             return
-        self.toast.show_message("Saved %s" % result, "good")
+        self.toast.show_message(result, "good")
 
     # ══ window ═══════════════════════════════════════════════════
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.toast.reposition()
+        # Ask the feed for frames that match the widget, at retina density and
+        # never more than the sensor is delivering.
+        self.feed.target = max(640, min(PREVIEW_MAX, self.preview.width() * 2))
         if self.mode == "edit":
+            self._uncropped = None
             self._queue_render()
 
     def closeEvent(self, e):
+        self._save_state()
         self.timer.stop()
+        self.feed.stop()
+        self.renderer.stop()
         self.cam.close()
         super().closeEvent(e)
 
 
+LOG_PATH = os.path.expanduser("~/Library/Logs/overhead-scanner.log")
+
+
+def _start_logging():
+    """Leave a record of a crash, including a native one.
+
+    A segmentation fault in OpenCV or Qt kills the process with no Python
+    traceback and, on this machine, no report in DiagnosticReports either —
+    which left a real crash with nothing to go on but "it crashed".
+    `faulthandler` prints a Python stack from the signal handler, so next time
+    there is something to read.
+    """
+    try:
+        fh = open(LOG_PATH, "a", buffering=1)
+    except OSError:
+        return None
+    fh.write("\n=== started %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    faulthandler.enable(fh)
+
+    def on_error(kind, value, tb):
+        traceback.print_exception(kind, value, tb, file=fh)
+        traceback.print_exception(kind, value, tb, file=sys.stderr)
+
+    sys.excepthook = on_error
+    threading.excepthook = lambda a: on_error(a.exc_type, a.exc_value, a.exc_traceback)
+    return fh
+
+
 def main():
+    _start_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("Overhead Scanner")
     app.setStyleSheet(QSS)

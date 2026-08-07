@@ -76,6 +76,12 @@ class Camera:
         self._frame = None
         self._seq = 0
         self._lock = threading.Lock()
+        # Serialises every call into the VideoCapture itself. Releasing or
+        # reconfiguring an AVFoundation session while another thread is inside
+        # read() is a native crash, not an exception — and at 16 MP a read
+        # takes ~100 ms, or seconds on a camera that is misbehaving, so the
+        # reader is very often mid-read exactly when the app wants to stop it.
+        self._cap_lock = threading.RLock()
         self._thread = None
         self._stop = threading.Event()
         self.error = None
@@ -276,9 +282,10 @@ class Camera:
             return False
         self._stop_reader()
         try:
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, target[0])
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target[1])
-            frame = self._await_size(self.cap, target[0], target[1], MODE_WAIT)
+            with self._cap_lock:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, target[0])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target[1])
+                frame = self._await_size(self.cap, target[0], target[1], MODE_WAIT)
         except Exception:
             frame = None
         if frame is not None and frame.shape[1] >= target[0] * 0.95:
@@ -326,9 +333,19 @@ class Camera:
 
     def close(self):
         self._stop_reader()
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        cap, self.cap = self.cap, None
+        if cap is not None:
+            # If the reader is somehow still inside read(), wait for it rather
+            # than release underneath it. Failing that, drop the object without
+            # releasing: leaking one capture until the process exits is an
+            # unpleasant outcome, and a segfault is a much worse one.
+            if self._cap_lock.acquire(timeout=4.0):
+                try:
+                    cap.release()
+                finally:
+                    self._cap_lock.release()
+            else:
+                self.error = "camera did not stop cleanly; left it open"
         with self._lock:
             self._frame = None
         self.width = self.height = 0
@@ -347,7 +364,10 @@ class Camera:
     def _stop_reader(self):
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            # Generous: one 16 MP read plus the time a stalling camera takes to
+            # give up. The lock below is what makes correctness independent of
+            # this number, but waiting properly avoids ever needing it.
+            self._thread.join(timeout=6.0)
             self._thread = None
 
     def _run(self):
@@ -356,7 +376,14 @@ class Camera:
             cap = self.cap
             if cap is None:
                 break
-            ok, frame = cap.read()
+            try:
+                with self._cap_lock:
+                    if self._stop.is_set() or self.cap is not cap:
+                        break
+                    ok, frame = cap.read()
+            except Exception as exc:                # noqa: BLE001
+                self.error = "camera read failed: %s" % exc
+                break
             if not ok or frame is None:
                 misses += 1
                 if misses > 90:
