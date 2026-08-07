@@ -194,8 +194,14 @@ class App:
         self._build_inspector(insp)
 
         # Probing each camera's maximum takes a few seconds; let the window
-        # appear first so it doesn't look like a hang.
-        self.root.after(150, self.refresh_devices)
+        # appear first so it doesn't look like a hang, then start the camera
+        # without waiting to be asked — the app has exactly one purpose.
+        self.root.after(150, self._startup)
+
+    def _startup(self):
+        self.refresh_devices()
+        if self.devices:
+            self.root.after(50, self.toggle_camera)
 
     def _small_btn(self, parent, text, cmd):
         return tk.Button(parent, text=text, command=cmd, bg=LINE, fg=FG,
@@ -883,6 +889,14 @@ class App:
 def main():
     root = tk.Tk()
     App(root)
+    # Tk opens behind whatever is in front on macOS; ask for focus once.
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(400, lambda: root.attributes("-topmost", False))
+    try:
+        root.createcommand("::tk::mac::ReopenApplication", root.lift)
+    except tk.TclError:
+        pass
     root.mainloop()
 
 
