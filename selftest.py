@@ -13,22 +13,27 @@ def ok(name, cond, detail=""):
 devs = camera.Camera.list_devices()
 ok("camera enumerated", len(devs) > 0, str(devs))
 if not devs: sys.exit(1)
+# Same choice the app makes: highest real maximum, not lowest index.
+devs.sort(key=lambda d: d["max_width"] * d["max_height"], reverse=True)
+best = devs[0]
+print("  using index %d (max %dx%d)" % (best["index"], best["max_width"], best["max_height"]))
 
 cam = camera.Camera()
 t0 = time.time()
-opened = cam.open(devs[0]["index"])
+opened = cam.open(best["index"], prefer=(best["max_width"], best["max_height"]))
 ok("camera opened", opened, "%d ms" % int((time.time()-t0)*1000))
 if not opened: print(cam.error); sys.exit(1)
-ok("running at the sensor maximum", (cam.width, cam.height) == (4656, 3496),
+ok("running at the device maximum", (cam.width, cam.height) == (best["max_width"], best["max_height"]),
    "%dx%d @ %.0f fps" % (cam.width, cam.height, cam.fps))
 
+cam_w, cam_h = cam.width, cam.height
 time.sleep(2.0)
 t0 = time.time(); frame = cam.grab(); grab_ms = int((time.time()-t0)*1000)
 ok("frame captured", frame is not None,
    "" if frame is None else "%dx%d in %d ms" % (frame.shape[1], frame.shape[0], grab_ms))
 cam.close()
 if frame is None: sys.exit(1)
-ok("capture is full resolution", frame.shape[:2] == (3496, 4656), str(frame.shape))
+ok("capture is full resolution", (frame.shape[1], frame.shape[0]) == (cam_w, cam_h), str(frame.shape))
 cv2.imwrite(OUT + "/py-raw.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
 
 t0 = time.time(); quad = detect.detect(frame); det_ms = int((time.time()-t0)*1000)

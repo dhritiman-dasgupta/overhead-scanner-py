@@ -145,7 +145,11 @@ class Camera:
             ladder = [tuple(prefer)] + [m for m in ladder if tuple(m) != tuple(prefer)]
 
         chosen = None
-        for (w, h) in ladder:
+        # The top mode is worth two attempts: this device intermittently fails
+        # to bring it up on the first request and would otherwise settle a rung
+        # lower, silently costing a third of the pixels.
+        attempts = [ladder[0]] + ladder if ladder else []
+        for (w, h) in attempts:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
             time.sleep(0.5)
@@ -161,14 +165,16 @@ class Camera:
                     continue
                 frame = f
                 fh, fw = f.shape[:2]
-                if fw * fh >= w * h * 0.8:
+                if fw >= w * 0.95 and fh >= h * 0.95:
                     break
             if frame is None:
                 continue
             gh, gw = frame.shape[:2]
-            # Accept a mode that returns something close to what was asked for;
-            # some drivers round to their nearest supported size.
-            if gw * gh >= w * h * 0.8:
+            # Compare per-dimension, not by area. An 80%-of-area tolerance
+            # accepts 4208x3120 as though it satisfied a 4656x3496 request —
+            # it is 80.6% of the area — and quietly costs a fifth of the
+            # pixels. Both sides must be close to what was asked for.
+            if gw >= w * 0.95 and gh >= h * 0.95:
                 chosen = (gw, gh)
                 break
 
