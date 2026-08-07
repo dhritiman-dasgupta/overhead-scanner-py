@@ -1,0 +1,11 @@
+import time, camera
+print("--- open WITHOUT enumerating first ---")
+c = camera.Camera(); t0=time.time()
+print("opened:", c.open(0), "%dx%d" % (c.width, c.height), "in %dms" % int((time.time()-t0)*1000))
+c.close(); time.sleep(1.0)
+print("--- enumerate, then open ---")
+devs = camera.Camera.list_devices(); print("devices:", devs)
+time.sleep(1.0)
+c = camera.Camera(); t0=time.time()
+print("opened:", c.open(0), "%dx%d" % (c.width, c.height), "in %dms" % int((time.time()-t0)*1000))
+c.close()
