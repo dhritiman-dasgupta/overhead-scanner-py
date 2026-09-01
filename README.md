@@ -1,5 +1,8 @@
 # Overhead Scanner (Python)
 
+> **Related:** [`overhead-scanner`](https://github.com/dhritiman-dasgupta/overhead-scanner) — browser sibling of this project, the same detection approach in a web app.
+
+
 A desktop app for an overhead document camera: capture at the sensor's full
 resolution, deskew, clean up, OCR, and export to image or searchable PDF.
 Everything runs locally.
